@@ -93,7 +93,7 @@ ciclo = [
     (44, 0, 0.0, GUARDIA, GUARDIA),
     (48, 0, 0.0, GUARDIA, GUARDIA),
 ]
-VUELTAS = 2
+VUELTAS = globals().get("VUELTAS_PUNOS", 2)
 LARGO = 48
 for v in range(VUELTAS):
     for f, rz, salto, d, i in ciclo:
