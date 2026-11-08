@@ -137,12 +137,30 @@ def _en_pelo_viejo(v):
 
 
 # línea del pelo: corte inclinado (alto delante por las entradas, bajo en la nuca)
-bmesh.ops.bisect_plane(bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:], plane_co=(0, 0, 0.03),
-                       plane_no=Vector((0, 0.65, 1)).normalized(), clear_inner=True)
-bm.normal_update()
-for v in bm.verts:
-    v.co += v.normal * 0.012
-bmesh.ops.solidify(bm, geom=bm.faces[:], thickness=0.018)
+# Pelo = unión de dos cortes del casquete:
+#  1) delante y lados: entradas altas en la frente y laterales rectos a la altura de la oreja;
+#  2) nuca: baja en diagonal desde detrás de la oreja hasta el cuello.
+def cortar(fuente, planos, despegue):
+    b = fuente.copy()
+    for co, no in planos:
+        bmesh.ops.bisect_plane(b, geom=b.verts[:] + b.edges[:] + b.faces[:], plane_co=co,
+                               plane_no=Vector(no).normalized(), clear_inner=True)
+    b.normal_update()
+    for v in b.verts:
+        v.co += v.normal * despegue
+    bmesh.ops.solidify(b, geom=b.faces[:], thickness=0.018)
+    return b
+
+
+delante = cortar(bm, [((0, 0, -0.124), (0, 1.2, 1)), ((0, 0, 0.0), (0, 0, 1))], 0.012)
+nuca = cortar(bm, [((0, 0.05, 0.0), (0, 1, 1)), ((0, 0, -0.22), (0, 0, 1)), ((0, 0.0, 0), (0, 1, 0))], 0.0115)
+bm.free()
+tmp_me = bpy.data.meshes.new("tmp_nuca")
+nuca.to_mesh(tmp_me)
+nuca.free()
+delante.from_mesh(tmp_me)
+bpy.data.meshes.remove(tmp_me)
+bm = delante
 b3.objeto("Pelo", bm, PELO, loc=(0, 0, HZ))
 
 # orejas
@@ -204,7 +222,7 @@ for s in (-1, 1):
 b3.objeto("Peana", b3.bm_revolucion([(0.36, -0.05), (0.37, -0.03), (0.36, 0.0), (0.0, 0.0)], 96), PEANA, loc=(0, 0, 0))
 
 # ---------------- escena ----------------
-b3.camara("FJ_Cam", (1.05, -2.35, 0.95), (0, 0, 0.55), lente=50)
+b3.camara("FJ_Cam", (0.75, -2.45, 0.85), (0, 0, 0.55), lente=50)
 b3.estudio((0, 0, 0.55), distancia=3.0, fuerza=1.1)
 b3.mundo("#C9CFD6", 0.6)
 b3.render("BLENDER_EEVEE", 1600, 1600, muestras=64, look="AgX - Medium High Contrast")
