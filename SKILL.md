@@ -29,6 +29,9 @@ buho-blender video anim.mp4 --camara orbita [--vueltas 1] [--segundos 10] [--hoj
                                          # la animación de la escena en MP4: cámara fija (la de la escena),
                                          # frontal u orbita; --hoja saca 6 fotogramas en una hoja para revisarlo
 buho-blender pantalla vista.png [--render]   # la vista 3D del Blender abierto tal como se ve (--render: sin interfaz)
+buho-blender comparar foto.jpg --blend x.blend [--vista camara] [--salida comp.png]
+                                         # render con el aspecto de la foto + imagen referencia | render | superposición
+                                         # | siluetas, con métricas (IoU de silueta y de forma, escala, color por zonas)
 
 # Hacer
 buho-blender run script.py [--var "VOXEL=0.009"]   # ejecuta Python (bpy); también "código" o - (entrada). result = {...}
@@ -45,6 +48,12 @@ buho-blender animar punetazos --nla                # --nla: la añade al final d
 buho-blender animar --json poses.json              # animación a medida
 buho-blender animar --reposo                       # quita la acción activa y vuelve a la pose de reposo
 buho-blender importar-animacion walk.fbx [--en-sitio] [--nla]   # p. ej. de Mixamo, pasada al esqueleto propio
+                                                   # --pies apoyar|no_atravesar|no, --cabeza auto|estable|libre
+
+# Renders largos en segundo plano
+buho-blender giro giro.mp4 --en-cola               # vuelve al instante con un id (vale para giro, video, captura, run, comparar)
+buho-blender cola                                  # trabajos con estado, fotogramas hechos/total, % y tiempo restante
+buho-blender cola ver <id> | esperar <id> | cancelar <id> | limpiar
 
 # Archivos
 buho-blender nuevo [salida.blend] [--vacia]   # escena de inicio sin mallas (--vacia: sin cámara ni luz)
@@ -58,15 +67,23 @@ buho-blender docs "bmesh bevel" [--api | --manual]   # busca en la documentació
 
 Opciones comunes: `--fondo`, `--archivo x.blend`, `--guardar x.blend`, `--texto` (muestra también lo que imprima el script), `--puerto N`, `--json`, `--timeout <s>` (600). Las capturas, el giro y el vídeo aceptan `--objetos "A,B"` o `--coleccion X` (el resto se oculta solo durante el render) y `--ancho/--alto`. Humo, niebla y cajas de volumen (nombre con «humo», «niebla», «fog»…, o material que solo tiene Volume) no cuentan para el encuadre y se ocultan en las vistas automáticas; `--con-niebla` los deja (con `--vista camara` y `video --camara fija` se dejan siempre).
 
+**Fondos, suelos y estudios** salen en el render pero no cuentan para el encuadre (un ciclorama de 40 m dejaba el logo diminuto). Se reconocen:
+
+- por la propiedad personalizada `buho_fondo = True` (en el objeto o en su malla), que es lo más seguro al modelar un escenario;
+- por el nombre: Fondo, Suelo, Floor, Ground, Backdrop, Background, Estudio, Studio, Ciclorama, Cyc, Telón, Infinito, Piso;
+- por la forma: un plano mucho más grande que el resto, una caja o cúpula que lo envuelve todo, o una losa grande por debajo.
+
+El JSON dice cuáles en `fondo_fuera_del_encuadre`. Si la cámara quedaría al otro lado de la pared del estudio (en un giro, por detrás), se acerca y abre la lente (`camara_dentro_del_fondo.lente_mm`); si ni así cabe, esa pieza se oculta solo en ese render. `--encuadrar "A,B"` fuerza qué objetos se encuadran (vale en `captura`, `--vistas`, `giro`, `video` y `comparar`).
+
 ## Cómo trabajar
 
 1. **Mira antes de tocar**: `estado`, `escena` y `stats`. No borres ni cambies objetos del usuario sin preguntar.
 2. **El modelo vive en un script**: escribe el modelado como un `.py` guardado junto al proyecto (no código suelto), para poder rehacerlo y versionarlo. El script debe ser idempotente: borra solo lo que él creó (por colección propia) y lo vuelve a crear.
-3. **Usa las librerías de `lib/`**: `import buho3d as b3` (piezas, materiales, modificadores), `import buho_sdf as S` (escultura) y `import buho_rig as br` (esqueletos y animación) funcionan en los dos modos: el CLI añade `lib/` al `sys.path` y las recarga en el Blender abierto si cambian. También se pueden importar módulos de la carpeta del script. El script corre con `__name__ == "__main__"` y `__file__` = su ruta; `--var NOMBRE=valor` le pasa variables globales.
+3. **Usa las librerías de `lib/`**: `import buho3d as b3` (piezas, materiales, modificadores), `import buho_sdf as S` (escultura), `import buho_rig as br` (esqueletos y animación), `import buho_apoyo` (pies en el suelo, cabeza estable) e `import buho_comparar` (comparar imágenes) funcionan en los dos modos: el CLI añade `lib/` al `sys.path` y las recarga en el Blender abierto si cambian. También se pueden importar módulos de la carpeta del script. El script corre con `__name__ == "__main__"` y `__file__` = su ruta; `--var NOMBRE=valor` le pasa variables globales.
 4. **Devuelve datos con `result = {...}`**, no con `print`.
 5. **Itera con `vigilar`**: deja `buho-blender vigilar modelo.py --captura c.png --vistas frente,derecha,tres_cuartos,arriba` en segundo plano; cada vez que guardas el .py (o `lib/buho3d.py`) lo vuelve a ejecutar y rehace la hoja. Cada pasada imprime una línea JSON con `ok`, `result` o `error`. `--veces N` para que acabe solo.
-6. **Comprueba con los ojos**: una hoja de contactos (`--vistas`) y léela antes de dar algo por bueno. La captura encuadra sola los objetos y pone cámara y luces temporales; no deja nada en la escena. Con `--vista camara` usa la cámara y la luz de la escena. `pantalla` enseña lo que ve el usuario en su ventana.
-7. **Para enseñarlo**: `giro modelo.mp4` (o `.gif`) da una vuelta al modelo quieto; `video anim.mp4 --camara orbita` graba la animación mientras la cámara gira.
+6. **Comprueba con los ojos**: una hoja de contactos (`--vistas`) y léela antes de dar algo por bueno. Si copias algo real (una foto, un logo, un producto), `comparar foto.jpg` antes de enseñarlo: mira la imagen y las métricas (ver «Comparar con una referencia»). La captura encuadra sola los objetos y pone cámara y luces temporales; no deja nada en la escena. Con `--vista camara` usa la cámara y la luz de la escena. `pantalla` enseña lo que ve el usuario en su ventana.
+7. **Para enseñarlo**: `giro modelo.mp4` (o `.gif`) da una vuelta al modelo quieto; `video anim.mp4 --camara orbita` graba la animación mientras la cámara gira. Si va a tardar (Cycles, vídeos largos), añade `--en-cola` y sigue trabajando; avisa al usuario del progreso con `cola`.
 8. **Exporta** a GLB para Unity (glTFast) o la web: Y arriba, escala aplicada, modificadores aplicados. Medidas reales en metros (`stats` da `tamano_m`).
 9. **Dudas de la API**: `buho-blender docs "keyframe_insert"` antes de inventarte un parámetro.
 
@@ -117,7 +134,15 @@ Opciones comunes: `--fondo`, `--archivo x.blend`, `--guardar x.blend`, `--texto`
 - La columna, el cuello, la cabeza, las manos y los pies copian el giro. En brazos y piernas se corrige además la pose de reposo (la T de Mixamo frente a brazos caídos).
 - La cadera se desplaza en proporción a la altura; `--en-sitio` quita el avance.
 - Sin esqueleto propio, deja el del FBX con su acción.
-- En figuras cabezonas los movimientos de Mixamo exageran: una inclinación del cuerpo mueve una cabeza enorme.
+- **Cabeza estable** (`--cabeza auto|estable|libre`, `--estabilidad 0..1`, 0,7 por defecto): en figuras cabezonas (cabeza de más del 25 % de la altura, tipo Funko) una inclinación normal del cuerpo mueve una cabeza enorme. Con `auto` (por defecto), en cabezones se amortigua la inclinación de cadera, columna, pecho y cuello (el tronco queda al ~40 %) y la cabeza se queda casi derecha (~10 % de su inclinación), conservando el giro a los lados. En el andar de Mixamo sobre el Funko: cabeza de 30–43° a 1–4°.
+- **Pies en el suelo** (`--pies`, ver abajo): la altura sobre el suelo la marca el esqueleto de origen, así un salto sigue siendo salto y al andar el pie que apoya toca el suelo.
+
+**Pies en el suelo** (`animar` e `importar-animacion`, `lib/buho_apoyo.py`): después de crear la acción se ajusta la altura de la cadera en cada fotograma para que el punto más bajo del personaje toque el suelo, sin atravesar la peana ni flotar.
+
+- El suelo se detecta solo: lo que haya justo debajo de los pies en reposo (peana, suelo, ciclorama, con rayos hacia abajo); si no hay nada, la altura de los pies en reposo. El JSON lo dice en `pies` (`suelo`, `suelo_z`, `ajuste_cm`).
+- `--pies apoyar` (por defecto): siempre tocando el suelo. `no_atravesar` (por defecto en `saltar` y en `--json`): solo sube lo que se hunde. `no`: como sale.
+- Ejemplo: `andar` en el Funko de Juan iba de −5,7 cm (la puntera dentro de la peana) a +1,8 cm (flotando); ahora 0 en todos los fotogramas.
+- No es IK: los pies pueden patinar un poco en horizontal.
 
 **Vídeo**: `video salida.mp4` renderiza el rango de la escena (o `--segundos` desde el inicio).
 
@@ -126,6 +151,28 @@ Opciones comunes: `--fondo`, `--archivo x.blend`, `--guardar x.blend`, `--texto`
 - Motor: `--motor EEVEE|CYCLES|WORKBENCH`.
 - No deja nada en la escena.
 - **Revisa siempre** con `--hoja revision.png` (`--n 6`): lee la hoja antes de dar el vídeo por bueno.
+
+## Comparar con una referencia
+
+`buho-blender comparar foto.png --blend modelo.blend --vista camara --salida comp.png` (o en directo, sin `--blend`):
+
+- Renderiza con el mismo aspecto que la referencia (`--alto 540`) y con fondo transparente (`--opaco` para dejar el del mundo).
+- Guarda `comp.png` (referencia | render | superposición al 50 % | siluetas: rojo solo en la referencia, azul solo en el render, blanco las dos) y el render suelto en `comp_render.png`.
+- **Métricas** (en el JSON):
+  - `silueta`, si la referencia tiene fondo uniforme o transparencia (`--umbral` para la tolerancia del fondo). `iou` compara con el mismo encuadre; `iou_forma` compara la forma (cada silueta recortada a su caja); `proporcion_ancho_alto`, `escala_render_vs_ref` y `desplazamiento_pct` dicen cómo mover o escalar la cámara o el modelo.
+  - `color_por_zonas`: color medio en una rejilla 3×3 sobre cada silueta (o la imagen entera) y su diferencia (RGB 0–255; menos de 25 se parece, más de 60 es muy distinto).
+- Para la forma importa sobre todo que `iou_forma` y la proporción se acerquen; un `iou` bajo con `escala` lejos de 1 solo es encuadre.
+
+## Renders en segundo plano (cola)
+
+Cualquier `giro`, `video`, `captura`, `run` o `comparar` con `--en-cola` (o `--segundo-plano`) se lanza en un proceso aparte y devuelve al momento un id:
+
+- Se renderiza con un Blender sin ventana, de uno en uno (los demás esperan su turno; `--paralelo` para no esperar).
+- En directo (sin `--fondo`), primero se guarda una copia de la escena abierta y se trabaja sobre ella: el Blender del usuario queda libre. La copia se borra al acabar.
+- `buho-blender cola`: lista con estado (`en_cola`, `corriendo`, `hecho`, `error`, `cancelado`, `perdido`), fotogramas hechos/total, porcentaje, tiempo transcurrido y restante estimado.
+- `cola ver <id>`: lo mismo, más el resultado JSON de la orden y las últimas líneas de Blender. `cola esperar <id>`: imprime una línea cada vez que avanza y acaba con el resultado. `cola cancelar <id>` mata ese Blender. `cola limpiar` borra los terminados.
+- Registro: `%LOCALAPPDATA%\Programs\BuhoBlender\trabajos\<id>.json` y `.log`.
+- **Avisa al usuario**: al lanzar, di el id y cuánto calculas; consulta `cola` de vez en cuando y cuéntale el % y el tiempo restante; al acabar, revisa la salida (o su `--hoja`) antes de darla por buena.
 
 ## Esculpir formas orgánicas con buho_sdf
 

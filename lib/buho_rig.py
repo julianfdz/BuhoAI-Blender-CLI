@@ -15,6 +15,7 @@ Convenciones:
   hacia delante, Y = -lado·ángulo lo abre hacia fuera, X positivo dobla la rodilla.
 """
 
+import importlib
 import json
 import math
 import os
@@ -769,7 +770,7 @@ def _loc_local(pb, loc, espacio):
 
 
 def animar(armature_nombre=None, accion=None, poses=None, segundos=None, fps=24, bucle=False, nla=False,
-           lado="R", nombre=None, intensidad=1.0, inicio=None):
+           lado="R", nombre=None, intensidad=1.0, inicio=None, pies=None):
     """Crea una Action con nombre en el esqueleto, a partir de una acción predefinida o de un JSON de poses."""
     _modo_objeto()
     sc = bpy.context.scene
@@ -884,6 +885,11 @@ def animar(armature_nombre=None, accion=None, poses=None, segundos=None, fps=24,
     resultado = {"accion": act.name, "esqueleto": arm.name, "fotogramas": [ini, fin], "fps": sc.render.fps,
                  "segundos": round((fin - ini) / sc.render.fps, 2), "huesos": rot_h, "con_desplazamiento": loc_h,
                  "bucle": bool(bucle), "ignorados": sorted(ignorados)}
+    # Pies en el suelo (lib/buho_apoyo.py): por defecto apoyados; en saltos y poses a medida, solo sin atravesar.
+    if pies is None:
+        pies = "no_atravesar" if (poses or accion == "saltar") else "apoyar"
+    import buho_apoyo
+    resultado["pies"] = importlib.reload(buho_apoyo).apoyar(arm, ini, fin, pies)
     if nla:
         pistas = arm.animation_data.nla_tracks
         pista = pistas.get("buho") or pistas.new()
@@ -940,7 +946,8 @@ def _norm(n):
     return re.sub(r"[^a-z0-9.]", "", n.split(":")[-1].lower())
 
 
-def importar_animacion(archivo, armature_nombre=None, nombre=None, en_sitio=False, conservar=False, nla=False):
+def importar_animacion(archivo, armature_nombre=None, nombre=None, en_sitio=False, conservar=False, nla=False,
+                       pies="apoyar", cabeza="auto", estabilidad=None):
     """Importa un FBX con animación. Si hay esqueleto destino, pasa la animación a sus huesos por nombre
     (Mixamo -> nombres de buho_rig, o nombres iguales) y borra lo importado."""
     _modo_objeto()
@@ -1016,8 +1023,13 @@ def importar_animacion(archivo, armature_nombre=None, nombre=None, en_sitio=Fals
         pb.rotation_mode = "QUATERNION"
     orden = [b for b in destino.data.bones]  # bones ya va de padres a hijos
     previas = {}
+    import buho_apoyo
+    buho_apoyo = importlib.reload(buho_apoyo)
+    estab = buho_apoyo.Estabilizador(destino, cabeza, estabilidad)
+    alturas_src = {}
     for f in range(f0, f1 + 1):
         sc.frame_set(f)
+        alturas_src[f] = buho_apoyo.altura_minima_huesos(src)
         pose_arm = {}
         for b in orden:
             P = pose_arm[b.parent.name] if b.parent else Quaternion()
@@ -1030,6 +1042,7 @@ def importar_animacion(archivo, armature_nombre=None, nombre=None, en_sitio=Fals
                 q_des_w = q_sp @ rest_s[sb].inverted() @ corr[b.name] @ (q_tgt_w @ rest_t[b.name])
                 q_des = q_tgt_w.inverted() @ q_des_w
                 basis = (P @ rel).inverted() @ q_des
+                basis = estab.ajustar(b.name, basis, P, rel, rest_t.get("cabeza", Quaternion()))
             pose_arm[b.name] = P @ rel @ basis
             pb = destino.pose.bones[b.name]
             if b.name in previas and previas[b.name].dot(basis) < 0:
@@ -1049,6 +1062,10 @@ def importar_animacion(archivo, armature_nombre=None, nombre=None, en_sitio=Fals
     act.use_fake_user = True
     sc.render.fps = int(round(sc.render.fps)) or 24
     sc.frame_start, sc.frame_end = f0, f1
+    # Pies en el suelo: la altura sobre el suelo la marca el esqueleto de origen (así un salto sigue siendo salto).
+    hs_src = (hs_suelo if raiz_s else 1.0)
+    objetivo = buho_apoyo.objetivo_desde_origen(alturas_src, esc, 0.08 * hs_src)
+    info_pies = buho_apoyo.apoyar(destino, f0, f1, pies, objetivo=objetivo, ignorar=nuevos) if pies not in (None, "no") else None
 
     if not conservar:
         for o in nuevos:
@@ -1063,7 +1080,8 @@ def importar_animacion(archivo, armature_nombre=None, nombre=None, en_sitio=Fals
                 bpy.data.actions.remove(a)
     resultado = {"importado": archivo, "esqueleto": destino.name, "accion": act.name, "fotogramas": [f0, f1],
                  "retarget": True, "parejas": pares, "sin_pareja": [b.name for b in destino.data.bones if b.name not in pares],
-                 "escala_desplazamiento": round(esc, 4), "en_sitio": bool(en_sitio)}
+                 "escala_desplazamiento": round(esc, 4), "en_sitio": bool(en_sitio),
+                 "pies": info_pies, **estab.info()}
     if nla:
         pista = destino.animation_data.nla_tracks.get("buho") or destino.animation_data.nla_tracks.new()
         pista.name = "buho"

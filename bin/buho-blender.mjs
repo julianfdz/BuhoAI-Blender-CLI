@@ -11,8 +11,9 @@ import path from "node:path";
 import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import * as cola from "../lib/buho_cola.mjs";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const HOST = process.env.BUHO_BLENDER_HOST || "127.0.0.1";
 let PORT = Number(process.env.BUHO_BLENDER_PORT || 9876);
 const BLENDER = process.env.BUHO_BLENDER_PATH || "D:\\Programas\\Blender\\blender.exe";
@@ -25,9 +26,14 @@ let TIMEOUT_MS = 600000;
 // ---------- utilidades ----------
 
 function fail(msg, code = 1) {
+  if (cola.activo()) cola.terminarTrabajo({ estado: "error", error: String(msg) });
   process.stderr.write(`buho-blender: ${msg}\n`);
   process.exit(code);
 }
+
+// Opciones que nunca llevan valor (así "--en-cola salida.mp4" no se come la salida).
+const SIN_VALOR = new Set(["en-cola", "segundo-plano", "paralelo", "fondo", "texto", "bucle", "nla", "transparente",
+  "con-niebla", "opaco", "descartar", "vacia", "cabezon", "sin-emparentar", "en-sitio", "conservar", "reposo"]);
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -36,7 +42,7 @@ function parseArgs(argv) {
     if (a.startsWith("--")) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith("--")) out[key] = true;
+      if (next === undefined || next.startsWith("--") || SIN_VALOR.has(key)) out[key] = true;
       else { out[key] = next; i++; }
     } else out._.push(a);
   }
@@ -68,7 +74,7 @@ function pyUsuario(code, file, vars = {}) {
     `for _bl in ${py([LIB, file ? path.dirname(file) : null].filter(Boolean))}:`,
     "    if _bl not in _bs.path:",
     "        _bs.path.insert(0, _bl)",
-    "for _bn in ('buho3d', 'buho_rig'):",
+    "for _bn in ('buho3d', 'buho_rig', 'buho_apoyo', 'buho_comparar'):",
     "    _bm = _bs.modules.get(_bn)",
     "    if _bm is not None and getattr(_bm, '__file__', None) and _bo.path.exists(_bm.__file__):",
     "        _bi.reload(_bm)",
@@ -142,9 +148,20 @@ function runBackground(code, blendFile) {
   const args = ["-b", "--factory-startup"];
   if (blendFile) args.push(blendFile);
   args.push("--python-exit-code", "1", "--python", tmp);
+  if (cola.activo()) {
+    // Trabajo en segundo plano: Blender asíncrono leyendo el progreso de su salida.
+    return cola.blenderConProgreso(BLENDER, args, TIMEOUT_MS).then((r) => {
+      fs.rmSync(tmp, { force: true });
+      return leerSalidaBlender(r);
+    });
+  }
   let p;
   try { p = spawnSync(BLENDER, args, { encoding: "utf8", maxBuffer: 512 * 1024 * 1024, timeout: TIMEOUT_MS }); }
   finally { fs.rmSync(tmp, { force: true }); }
+  return leerSalidaBlender(p);
+}
+
+function leerSalidaBlender(p) {
   if (p.error && p.error.code === "ETIMEDOUT") return { status: "error", message: `Blender sin ventana superó el tiempo máximo (${TIMEOUT_MS / 1000} s); súbelo con --timeout` };
   const lines = (p.stdout || "").split(/\r?\n/);
   for (const l of lines) {
@@ -183,6 +200,12 @@ function limpiarTraceback(msg) {
 }
 
 function show(resp, opts) {
+  if (cola.activo()) {
+    // En un trabajo de la cola el resultado va a su registro (buho-blender cola ver <id>).
+    if (resp.status === "ok") cola.terminarTrabajo({ estado: "hecho", resultado: resp.result });
+    else cola.terminarTrabajo({ estado: "error", error: limpiarTraceback(resp.message || JSON.stringify(resp)) });
+    process.exit(resp.status === "ok" ? 0 : 1);
+  }
   if (resp.status !== "ok") {
     if (resp.stdout) process.stderr.write(String(resp.stdout));
     process.stderr.write(limpiarTraceback(resp.message || JSON.stringify(resp)).trimEnd() + "\n");
@@ -231,7 +254,7 @@ result = {"escena": bpy.context.scene.name, "unidades": bpy.context.scene.unit_s
 
 // Piezas comunes de captura y giro: qué se fotografía, encuadre, cámara y luces temporales,
 // motor (Cycles con GPU si hay) y cómo dejarlo todo como estaba.
-function pyKitFoto({ objetos, coleccion, frame = null, conNiebla = false }) {
+function pyKitFoto({ objetos, coleccion, frame = null, conNiebla = false, encuadrar = [] }) {
   return `
 import bpy, math, mathutils, os, tempfile, shutil
 sc = bpy.context.scene
@@ -264,6 +287,15 @@ def _restaurar():
     _guardados.clear()
 # Lo primero que se guarda es lo último que se restaura: que las preferencias no queden "con cambios".
 _guardados.append((bpy.context.preferences, "is_dirty", bpy.context.preferences.is_dirty))
+
+def _buho_total(n):
+    # Para la cola de renders: cuántos fotogramas va a renderizar (lo lee el CLI de la salida de Blender).
+    import sys as _s
+    try:
+        _s.__stdout__.write("__BUHO_TOTAL__ %d\\n" % int(n))
+        _s.__stdout__.flush()
+    except Exception:
+        pass
 
 _temp = []
 def _limpiar_temp():
@@ -313,8 +345,127 @@ if not ${py(!!conNiebla)}:
     for _n in _niebla:
         if not bpy.data.objects[_n].hide_render:
             _poner(bpy.data.objects[_n], "hide_render", True)
+
+def _pts_inst(inst):
+    # Esquinas en mundo de una instancia del depsgraph (con modificadores).
+    m = inst.matrix_world.copy()
+    ob = inst.object
+    if ob.type != "MESH":
+        # En curvas y textos el bound_box puede venir sin calcular (±1): se mide la malla evaluada.
+        try:
+            me = ob.to_mesh()
+        except RuntimeError:
+            me = None
+        if me is not None and len(me.vertices):
+            vs = [v.co for v in me.vertices]
+            lo = [min(v[i] for v in vs) for i in range(3)]
+            hi = [max(v[i] for v in vs) for i in range(3)]
+            ob.to_mesh_clear()
+            return [m @ mathutils.Vector((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]
+        if me is not None:
+            ob.to_mesh_clear()
+    return [m @ mathutils.Vector(c) for c in ob.bound_box]
+
+def _cajas_por_obj(nombres):
+    # Caja (min, max) en mundo de cada objeto (con sus instancias), en una sola pasada.
+    bpy.context.view_layer.update()
+    dg = bpy.context.evaluated_depsgraph_get()
+    cajas = {}
+    for inst in dg.object_instances:
+        raiz = inst.parent.original if (inst.is_instance and inst.parent) else inst.object.original
+        if raiz.name not in nombres or inst.object.type not in _TIPOS:
+            continue
+        ps = _pts_inst(inst)
+        lo = mathutils.Vector((min(p.x for p in ps), min(p.y for p in ps), min(p.z for p in ps)))
+        hi = mathutils.Vector((max(p.x for p in ps), max(p.y for p in ps), max(p.z for p in ps)))
+        if raiz.name in cajas:
+            a, b = cajas[raiz.name]
+            lo = mathutils.Vector(map(min, a, lo))
+            hi = mathutils.Vector(map(max, b, hi))
+        cajas[raiz.name] = (lo, hi)
+    return cajas
+
+# Fondos, suelos y estudios: salen en la foto pero no cuentan para el encuadre (un ciclorama de 40 m deja el
+# modelo diminuto). Se detectan por la propiedad buho_fondo, por el nombre o por la forma (plano grande,
+# caja que lo envuelve todo, losa grande por debajo). --encuadrar "A,B" lo fuerza.
+_PAL_FONDO = ("fondo", "suelo", "floor", "ground", "backdrop", "background", "estudio", "studio", "ciclorama",
+              "cyclorama", "cyc", "telon", "infinito", "piso")
+_encuadrar = ${py(encuadrar || [])}
+_fondo = {}
+def _marca_fondo(o):
+    for d in (o, getattr(o, "data", None)):
+        try:
+            if d is not None and d.get("buho_fondo"):
+                return "propiedad buho_fondo"
+        except Exception:
+            pass
+    if any(p in _PAL_FONDO or p.rstrip("s") in _PAL_FONDO for p in _palabras_n(o.name)):
+        return "nombre"
+    return None
+if True:
+    _cand = [o for o in objs if o.name not in _niebla]
+    for o in _cand:
+        _m = _marca_fondo(o)
+        if _m:
+            _fondo[o.name] = _m
+    _resto = [o for o in _cand if o.name not in _fondo]
+    _cj = _cajas_por_obj(set(o.name for o in _resto))
+    def _tam(o):
+        return max(_cj[o.name][1] - _cj[o.name][0])
+    def _motivo_fondo(g):
+        # g frente a todo lo que es más pequeño que él: plano grande, caja o cúpula que lo envuelve, losa debajo.
+        Dg_ = _tam(g)
+        otros = [o for o in _resto if o is not g and o.name in _cj and _tam(o) < Dg_]
+        if not otros:
+            return None
+        omn = mathutils.Vector([min(_cj[o.name][0][i] for o in otros) for i in range(3)])
+        omx = mathutils.Vector([max(_cj[o.name][1][i] for o in otros) for i in range(3)])
+        So = max(max(omx - omn), 1e-6)
+        gmn, gmx = _cj[g.name]
+        dmin = min(gmx - gmn)
+        tol = 0.02 * So
+        envuelve = all(gmn[i] <= omn[i] + tol and gmx[i] >= omx[i] - tol for i in range(3))
+        if dmin <= 0.02 * Dg_ and Dg_ >= 1.5 * So:
+            return "plano grande"
+        if envuelve and Dg_ >= 4 * So:
+            return "lo envuelve todo (estudio, ciclorama o cúpula)"
+        if gmx.z <= omn.z + 0.05 * So and Dg_ >= 3 * So:
+            return "suelo grande por debajo"
+        return None
+    _cambio = True
+    while _cambio and len(_resto) > 1:
+        _cambio = False
+        for _g in sorted([o for o in _resto if o.type in ("MESH", "SURFACE") and o.name in _cj], key=lambda o: -_tam(o)):
+            _m = _motivo_fondo(_g)
+            if _m:
+                _fondo[_g.name] = _m
+                _resto.remove(_g)
+                _cambio = True
+                break
+    _nset = set(o.name for o in _resto)
+    if not _nset:
+        # Si todo parece fondo, se encuadra todo (un plano solo es el modelo).
+        _fondo = {}
+        _nset = set(o.name for o in _cand) or set(o.name for o in objs)
+if _encuadrar:
+    # --encuadrar manda: solo esos cuentan para el encuadre (y no se tratan como fondo).
+    _falta = [n for n in _encuadrar if n not in bpy.data.objects]
+    if _falta:
+        raise RuntimeError("--encuadrar: no existen " + ", ".join(_falta))
+    _nset = set(_encuadrar)
+    for _n in _encuadrar:
+        _fondo.pop(_n, None)
+def _info_encuadre():
+    d = {}
+    if _fondo:
+        d["fondo_fuera_del_encuadre"] = _fondo
+    if _encuadrar:
+        d["encuadrados"] = sorted(_nset)
+    if _ajuste_fondo:
+        d["camara_dentro_del_fondo"] = dict(_ajuste_fondo)
+    return d
+
 # Caja de lo que se ve, con modificadores e instancias (y con la pose del fotograma actual).
-_nset = set(o.name for o in objs if o.name not in _niebla) or set(o.name for o in objs)
 def _calc_pts():
     bpy.context.view_layer.update()
     dg = bpy.context.evaluated_depsgraph_get()
@@ -323,24 +474,7 @@ def _calc_pts():
         raiz = inst.parent.original if (inst.is_instance and inst.parent) else inst.object.original
         if raiz.name not in _nset or inst.object.type not in _TIPOS:
             continue
-        m = inst.matrix_world.copy()
-        ob = inst.object
-        if ob.type != "MESH":
-            # En curvas y textos el bound_box puede venir sin calcular (±1): se mide la malla evaluada.
-            try:
-                me = ob.to_mesh()
-            except RuntimeError:
-                me = None
-            if me is not None and len(me.vertices):
-                vs = [v.co for v in me.vertices]
-                lo = [min(v[i] for v in vs) for i in range(3)]
-                hi = [max(v[i] for v in vs) for i in range(3)]
-                ob.to_mesh_clear()
-                pts.extend(m @ mathutils.Vector((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2]))
-                continue
-            if me is not None:
-                ob.to_mesh_clear()
-        pts.extend(m @ mathutils.Vector(c) for c in ob.bound_box)
+        pts.extend(_pts_inst(inst))
     if not pts:
         pts = [o.matrix_world @ mathutils.Vector(c) for o in objs if o.name in _nset for c in o.bound_box]
     return pts
@@ -389,8 +523,61 @@ def _camara():
     _temp.append(cam)
     return cam
 
+def _tope_fondo(d):
+    # Distancia desde el centro, en la dirección d, a la primera pared de un fondo (y cuáles corta).
+    dg = bpy.context.evaluated_depsgraph_get()
+    mejor, cortan = None, []
+    for n in _fondo:
+        ob = bpy.data.objects.get(n)
+        if ob is None or ob.type != "MESH" or ob.hide_render:
+            continue
+        oe = ob.evaluated_get(dg)
+        mw = oe.matrix_world
+        inv = mw.inverted()
+        try:
+            ok, loc, _nor, _i = oe.ray_cast(inv @ centro, (inv.to_3x3() @ d).normalized())
+        except Exception:
+            continue
+        if ok:
+            t = (mw @ loc - centro).length
+            cortan.append(n)
+            mejor = t if mejor is None else min(mejor, t)
+    return mejor, cortan
+
+_ajuste_fondo = {}
+def _distancia(cam, dirs, rx, ry):
+    # Distancia que vale para todas las direcciones. Si la cámara quedaría al otro lado de la pared de un
+    # fondo (estudio, ciclorama), se acerca y abre la lente; si ni así cabe, oculta esa pieza en el render.
+    cam.data.lens = 50
+    dist = max(_encuadre(dk, cam.data, rx, ry)[0] for dk in dirs)
+    if not _fondo:
+        return dist
+    topes = [_tope_fondo(dk) for dk in dirs]
+    hits = [t for t in topes if t[0] is not None]
+    if not hits:
+        return dist
+    tope = min(t[0] for t in hits) * 0.95
+    if dist <= tope:
+        return dist
+    lente = 50.0
+    for _k in range(10):
+        lente *= tope / dist
+        if lente < 14:
+            break
+        cam.data.lens = lente
+        dist = max(_encuadre(dk, cam.data, rx, ry)[0] for dk in dirs)
+        if dist <= tope:
+            _ajuste_fondo["lente_mm"] = round(lente, 1)
+            return dist
+    cam.data.lens = 50
+    for n in sorted(set(n for t in hits for n in t[1])):
+        _poner(bpy.data.objects[n], "hide_render", True)
+        _ajuste_fondo.setdefault("ocultos", []).append(n)
+    return max(_encuadre(dk, cam.data, rx, ry)[0] for dk in dirs)
+
 def _colocar(cam, d, rx, ry):
-    dist, rot = _encuadre(d, cam.data, rx, ry)
+    dist = _distancia(cam, [d], rx, ry)
+    rot = (-d).to_track_quat("-Z", "Y")
     cam.location = centro + d * dist
     cam.rotation_euler = rot.to_euler()
     cam.data.clip_start = max(dist / 1000, 0.001)
@@ -511,8 +698,8 @@ def _hoja(rutas, salida, rx, ry, cols=None, transparente=False):
 `;
 }
 
-function pyCaptura({ salida, vistas, ancho, alto, motor, muestras, objetos, coleccion, fondoTransparente, columnas, frame, conNiebla }) {
-  return pyKitFoto({ objetos, coleccion, frame, conNiebla: conNiebla || vistas.every((v) => v === "camara") }) + `
+function pyCaptura({ salida, vistas, ancho, alto, motor, muestras, objetos, coleccion, fondoTransparente, columnas, frame, conNiebla, encuadrar }) {
+  return pyKitFoto({ objetos, coleccion, frame, encuadrar, conNiebla: conNiebla || vistas.every((v) => v === "camara") }) + `
 import numpy as np
 salida = ${py(salida)}
 vistas = ${py(vistas)}
@@ -536,6 +723,8 @@ try:
         luces = _luces()
     _poner(sc, "camera", sc.camera)
     rutas = []
+    _ajustes_vistas = {}
+    _buho_total(len(vistas))
     for i, v in enumerate(vistas):
         ruta = salida if len(vistas) == 1 else os.path.join(tmp, "%02d_%s.png" % (i, v))
         if v == "camara":
@@ -550,6 +739,12 @@ try:
         sc.render.filepath = ruta
         bpy.ops.render.render(write_still=True)
         rutas.append(ruta)
+        if _ajuste_fondo:
+            # El ajuste al fondo es de cada vista: se apunta y se deshace para la siguiente.
+            for n in _ajuste_fondo.get("ocultos", []):
+                bpy.data.objects[n].hide_render = False
+            _ajustes_vistas[v] = dict(_ajuste_fondo)
+            _ajuste_fondo.clear()
     if len(rutas) > 1:
         cols, filas = _hoja(rutas, salida, rx, ry, ${columnas ? Number(columnas) : "None"}, transparente)
 finally:
@@ -558,9 +753,11 @@ finally:
     shutil.rmtree(tmp, ignore_errors=True)
     sc.frame_set(_frame_viejo_kit)
 result = {"frame": sc.frame_current if _frame_kit is None else int(_frame_kit), "captura": salida, "vistas": vistas, "objetos": [o.name for o in objs],
-          "tamano": [round(v, 3) for v in (mx - mn)], **info}
+          "tamano": [round(v, 3) for v in (mx - mn)], **info, **_info_encuadre()}
 if _niebla:
     result["fuera_del_encuadre"] = _niebla
+if _ajustes_vistas:
+    result["camara_dentro_del_fondo"] = _ajustes_vistas
 if len(vistas) > 1:
     result["hoja"] = {"columnas": cols, "filas": filas, "orden": "de izquierda a derecha y de arriba abajo"}
 if aviso:
@@ -568,8 +765,8 @@ if aviso:
 `;
 }
 
-function pyGiro({ salida, gif, tmpdir, segundos, fps, ancho, alto, motor, muestras, vista, objetos, coleccion, conNiebla }) {
-  return pyKitFoto({ objetos, coleccion, conNiebla }) + `
+function pyGiro({ salida, gif, tmpdir, segundos, fps, ancho, alto, motor, muestras, vista, objetos, coleccion, conNiebla, encuadrar }) {
+  return pyKitFoto({ objetos, coleccion, conNiebla, encuadrar }) + `
 import numpy as np
 salida = ${py(salida)}
 es_gif = ${py(gif)}
@@ -603,10 +800,7 @@ try:
     cam = _camara()
     cam.parent = pivote
     d = _dir(${py(vista)})
-    dist = 0.0
-    for k in range(24):
-        dk = mathutils.Matrix.Rotation(2 * math.pi * k / 24, 3, "Z") @ d
-        dist = max(dist, _encuadre(dk, cam.data, rx, ry)[0])
+    dist = _distancia(cam, [mathutils.Matrix.Rotation(2 * math.pi * k / 24, 3, "Z") @ d for k in range(24)], rx, ry)
     cam.location = d * dist
     cam.rotation_euler = (-d).to_track_quat("-Z", "Y").to_euler()
     cam.data.clip_start = max(dist / 1000, 0.001)
@@ -626,6 +820,7 @@ try:
     _poner(sc.render, "fps_base", 1.0)
     _poner(sc.render, "use_file_extension", True)
     _poner(sc.render, "filepath", os.path.join(tmp, "f_####" if es_gif else "giro_"))
+    _buho_total(fotogramas)
     try:
         bpy.ops.render.render(animation=True)
     finally:
@@ -633,7 +828,7 @@ try:
 finally:
     _restaurar()
     _limpiar_temp()
-result = {"objetos": [o.name for o in objs], "fotogramas": fotogramas, "fps": fps, "tamano_px": [rx, ry], **info}
+result = {"objetos": [o.name for o in objs], "fotogramas": fotogramas, "fps": fps, "tamano_px": [rx, ry], **info, **_info_encuadre()}
 if es_gif:
     # Fotogramas en bruto (RGB de arriba abajo) para que el CLI los codifique en GIF.
     pngs = sorted(f for f in os.listdir(tmp) if f.startswith("f_") and f.endswith(".png"))
@@ -658,8 +853,8 @@ else:
 }
 
 // Vídeo de la animación de la escena: cámara de la escena (fija), frontal automática u orbitando alrededor.
-function pyVideo({ salida, tmpdir, camara, vueltas, segundos, fps, ancho, alto, motor, muestras, vista, objetos, coleccion, luces, hoja, nHoja, conNiebla }) {
-  return pyKitFoto({ objetos, coleccion, conNiebla: conNiebla || camara === "fija" }) + `
+function pyVideo({ salida, tmpdir, camara, vueltas, segundos, fps, ancho, alto, motor, muestras, vista, objetos, coleccion, luces, hoja, nHoja, conNiebla, encuadrar }) {
+  return pyKitFoto({ objetos, coleccion, encuadrar, conNiebla: conNiebla || camara === "fija" }) + `
 salida = ${py(salida)}
 modo = ${py(camara)}
 rx, ry = ${ancho}, ${alto}
@@ -715,11 +910,8 @@ try:
         pivote.location = centro
         cam = _camara()
         cam.parent = pivote
-        dist = 0.0
         pasos = 24 if modo == "orbita" else 1
-        for k in range(pasos):
-            dk = mathutils.Matrix.Rotation(2 * math.pi * k / pasos, 3, "Z") @ d
-            dist = max(dist, _encuadre(dk, cam.data, rx, ry)[0])
+        dist = _distancia(cam, [mathutils.Matrix.Rotation(2 * math.pi * k / pasos, 3, "Z") @ d for k in range(pasos)], rx, ry)
         cam.location = d * dist
         cam.rotation_euler = (-d).to_track_quat("-Z", "Y").to_euler()
         cam.data.clip_start = max(dist / 1000, 0.001)
@@ -736,6 +928,7 @@ try:
             pivote.keyframe_insert("rotation_euler", index=2, frame=f1 + 1)
     _poner(sc.render, "use_file_extension", True)
     _poner(sc.render, "filepath", os.path.join(tmp, "video_"))
+    _buho_total((f1 - f0 + 1) + (${Number(nHoja) || 6} if hoja else 0))
     bpy.ops.render.render(animation=True)
     if hoja:
         # Unos fotogramas sueltos en una hoja de contactos, para revisar el vídeo sin abrirlo.
@@ -766,7 +959,7 @@ shutil.move(os.path.join(tmp, hechos[0]), salida)
 shutil.rmtree(tmp, ignore_errors=True)
 result = {"video": salida, "bytes": os.path.getsize(salida), "camara": camara_usada, "fotogramas": [f0, f1],
           "fps": int(fps), "segundos": round((f1 - f0 + 1) / fps, 2), "tamano_px": [rx, ry],
-          "luces": "estudio" if estudio else "escena", "objetos": len(objs), **info}
+          "luces": "estudio" if estudio else "escena", "objetos": len(objs), **info, **_info_encuadre()}
 if modo == "orbita":
     result["vueltas"] = ${Number(vueltas)}
 if hoja_info:
@@ -786,6 +979,42 @@ function pyRig(funcion, args) {
     "_br = _bi.reload(_br)",
     `result = _br.${funcion}(**_bj.loads(${py(JSON.stringify(args))}))`,
   ].join("\n");
+}
+
+// Llama a una función de un módulo de lib/ (recargándolo) con argumentos en JSON; deja la respuesta en `result`.
+function pyLib(modulo, funcion, args, variable = "result") {
+  return [
+    "import sys as _bs, importlib as _bi, json as _bj",
+    `if ${py(LIB)} not in _bs.path:`,
+    `    _bs.path.insert(0, ${py(LIB)})`,
+    `import ${modulo} as _bmod`,
+    "_bmod = _bi.reload(_bmod)",
+    `${variable} = _bmod.${funcion}(**_bj.loads(${py(JSON.stringify(args))}))`,
+  ].join("\n");
+}
+
+// comparar: render con el encuadre y el aspecto de la referencia y comparación lado a lado (lib/buho_comparar.py).
+function pyComparar({ referencia, salida, renderRuta, alto, vista, motor, muestras, objetos, coleccion, frame, conNiebla, encuadrar, opaco, umbral }) {
+  const pre = `
+import bpy as _b
+_im = _b.data.images.load(${py(referencia)}, check_existing=False)
+_rw, _rh = _im.size
+_b.data.images.remove(_im)
+if not _rw or not _rh:
+    raise RuntimeError("Blender no puede leer la referencia")
+_cmp_ry = ${Number(alto)}
+_cmp_rx = max(16, int(round(_cmp_ry * _rw / _rh / 2)) * 2)
+`;
+  const cap = pyCaptura({
+    salida: renderRuta, vistas: [vista], ancho: "_cmp_rx", alto: "_cmp_ry", motor, muestras, objetos, coleccion,
+    fondoTransparente: !opaco, columnas: null, frame, conNiebla, encuadrar,
+  });
+  return pre + cap + "\n_cap = result\n" + pyLib("buho_comparar", "comparar", { referencia, render: renderRuta, salida, umbral }) + `
+result["referencia"] = ${py(referencia)}
+result["referencia_px"] = [_rw, _rh]
+result["render"] = ${py(renderRuta)}
+result["captura"] = {k: _cap[k] for k in ("vistas", "objetos", "motor", "aviso", "fondo_fuera_del_encuadre", "frame") if k in _cap}
+`;
 }
 
 function pyExportar({ salida, objetos, coleccion, unir }) {
@@ -1376,7 +1605,11 @@ Mirar
           [--ancho 1280 --alto 720] [--motor BLENDER_EEVEE|BLENDER_WORKBENCH|CYCLES] [--muestras N]
           [--objetos "A,B" | --coleccion X] [--transparente] [--frame N] [--con-niebla]
                                             (Cycles usa la GPU si hay; humo/niebla/volúmenes no cuentan para el
-                                            encuadre y se ocultan salvo --con-niebla o --vista camara)
+                                            encuadre y se ocultan salvo --con-niebla o --vista camara;
+                                            fondos, suelos y estudios salen pero no cuentan para el encuadre:
+                                            nombre Fondo/Suelo/Floor/Backdrop/Estudio/Ciclorama, propiedad
+                                            buho_fondo=True, o plano grande / caja que lo envuelve todo.
+                                            --encuadrar "A,B" fuerza qué se encuadra)
   giro <salida.mp4|.gif> [--segundos 4] [--fps 24] [--vista tres_cuartos] [--ancho 720 --alto 720]
           [--motor ...] [--muestras N] [--objetos "A,B" | --coleccion X]   vuelta de 360°, no deja nada
   pantalla <salida.png> [--render]          la vista 3D del Blender abierto tal como se ve
@@ -1385,6 +1618,10 @@ Mirar
           [--motor EEVEE|CYCLES|WORKBENCH] [--muestras N] [--ancho 1280 --alto 720] [--vista tres_cuartos]
           [--luces auto|escena|estudio] [--hoja revision.png [--n 6]] [--objetos "A,B" | --coleccion X]
                                             renderiza la animación de la escena; no deja nada en la escena
+  comparar <referencia.png|jpg> [--blend x.blend | --fondo --archivo x.blend] [--vista camara] [--salida c.png]
+          [--alto 540] [--opaco] [--umbral 0.12] [--frame N] [--objetos ...]
+                                            render con el aspecto de la referencia y una imagen referencia | render |
+                                            superposición | siluetas, con métricas de silueta y color por zonas
 
 Esqueleto y animación
   esqueleto [objeto] [--coleccion X] [--tipo humanoide|cuadrupedo|cadena] [--auto] [--huesos huesos.json]
@@ -1393,11 +1630,21 @@ Esqueleto y animación
                                             piezas sueltas = cada pieza a su hueso (por nombre y posición)
   animar <andar|punetazos|saludar|saltar|bailar|idle|asentir|girar_cabeza> [--armature X] [--segundos 4]
           [--fps 24] [--bucle] [--nla] [--lado L|R] [--intensidad 1] [--nombre X] [--inicio F]
+          [--pies apoyar|no_atravesar|no]   pies en el suelo (por defecto apoyar; saltar y --json: no_atravesar)
   animar --json poses.json [...]            animación a medida: [{frame, huesos: {nombre: {rot:[x,y,z]°, loc:[m]}},
                                             interp, easing}]; --nla encadena acciones en una pista NLA
   animar --reposo [--armature X]            quita la acción activa y deja la pose de reposo
   importar-animacion <archivo.fbx> [--armature X] [--nombre X] [--en-sitio] [--nla] [--conservar]
-                                            p. ej. de Mixamo: la pasa al esqueleto por nombres de hueso
+          [--pies apoyar|no_atravesar|no] [--cabeza auto|estable|libre] [--estabilidad 0.7]
+                                            p. ej. de Mixamo: la pasa al esqueleto por nombres de hueso; en figuras
+                                            cabezonas la cabeza se queda derecha y el tronco se inclina menos
+
+Renders en segundo plano
+  <giro|video|captura|run|comparar> ... --en-cola [--paralelo]
+                                            vuelve al instante con un id; se renderiza en un Blender aparte, de uno
+                                            en uno (en directo, sobre una copia de la escena abierta)
+  cola [lista] | cola ver <id> | cola esperar <id> | cola cancelar <id> | cola limpiar
+                                            estado, fotogramas hechos/total, %, tiempo restante y resultado
 
 Hacer
   run <script.py | "código" | ->            ejecuta Python (bpy). Para devolver datos: result = {...}
@@ -1449,6 +1696,7 @@ function opcionesCaptura(opts, salida) {
     motor: str(opts.motor) || "BLENDER_EEVEE", muestras: opts.muestras ? num(opts.muestras) : null,
     objetos: lista(opts.objetos), coleccion: str(opts.coleccion), fondoTransparente: !!opts.transparente,
     columnas: opts.columnas ? num(opts.columnas) : null, conNiebla: !!opts["con-niebla"], frame: opts.frame !== undefined ? num(opts.frame) : null,
+    encuadrar: lista(opts.encuadrar),
   };
 }
 
@@ -1526,7 +1774,42 @@ async function main() {
   if (opts.puerto) PORT = num(opts.puerto, PORT);
   if (opts.timeout) TIMEOUT_MS = num(opts.timeout, 600) * 1000;
 
+  // Cola de renders (lib/buho_cola.mjs): --en-cola lanza la orden aparte y vuelve con un id.
+  if (opts["en-cola"] || opts["segundo-plano"]) {
+    const r = await cola.encolar({
+      cmd, argv: process.argv.slice(2), opts, script: fileURLToPath(import.meta.url),
+      guardarCopia: async (copia) => {
+        const resp = await sendToOpen(`import bpy, os\nos.makedirs(os.path.dirname(${py(copia)}), exist_ok=True)\nbpy.ops.wm.save_as_mainfile(filepath=${py(copia)}, copy=True)\nresult = {"copia": ${py(copia)}}`);
+        if (resp.status !== "ok") throw new Error("no he podido copiar la escena abierta: " + resp.message);
+      },
+    });
+    process.stdout.write(salidaJSON(r, opts) + "\n");
+    return;
+  }
+  if (typeof opts._trabajo === "string") {
+    if (!opts.timeout) TIMEOUT_MS = 6 * 3600 * 1000;
+    await cola.iniciarTrabajo(opts._trabajo);
+  }
+
   switch (cmd) {
+    case "cola":
+    case "trabajos": {
+      const sub = arg || "lista";
+      const id = opts._[2];
+      const linea = (o) => process.stdout.write(JSON.stringify(o, null, opts.json ? 0 : 2) + "\n");
+      if (sub === "lista" || sub === "ls") return linea(cola.listar());
+      if (sub === "limpiar") return linea(cola.limpiar());
+      if (!id) fail(`falta el id: buho-blender cola ${sub} <id>`);
+      if (sub === "ver") return linea(cola.ver(id, num(opts.lineas, 15)));
+      if (sub === "cancelar") return linea(cola.cancelar(id));
+      if (sub === "esperar") {
+        const fin = await cola.esperar(id, (o) => process.stdout.write(JSON.stringify(o) + "\n"), num(opts.cada, 2) * 1000);
+        linea(fin);
+        process.exit(fin.estado === "hecho" ? 0 : 1);
+      }
+      fail("cola [lista] | ver <id> | esperar <id> | cancelar <id> | limpiar");
+      return;
+    }
     case undefined:
     case "ayuda":
     case "help":
@@ -1587,7 +1870,7 @@ async function main() {
         ancho: par(num(opts.ancho, gif ? 480 : 720)), alto: par(num(opts.alto, gif ? 480 : 720)),
         motor: str(opts.motor) || "BLENDER_EEVEE", muestras: opts.muestras ? num(opts.muestras) : null,
         vista: str(opts.vista) || "tres_cuartos", objetos: lista(opts.objetos), coleccion: str(opts.coleccion),
-        conNiebla: !!opts["con-niebla"],
+        conNiebla: !!opts["con-niebla"], encuadrar: lista(opts.encuadrar),
       });
       const r = await execute(code, opts, { guardar: false });
       if (r.status === "ok" && gif) {
@@ -1618,6 +1901,7 @@ async function main() {
         armature_nombre: str(opts.armature), accion: arg || null, poses, segundos: opts.segundos ? num(opts.segundos) : null,
         fps: num(opts.fps, 24), bucle: !!opts.bucle, nla: !!opts.nla, lado: str(opts.lado) || "R",
         nombre: str(opts.nombre), intensidad: num(opts.intensidad, 1), inicio: opts.inicio ? num(opts.inicio) : null,
+        pies: str(opts.pies),
       };
       return show(await execute(pyRig("animar", args), opts), opts);
     }
@@ -1625,7 +1909,10 @@ async function main() {
       if (!arg) fail("falta el .fbx con la animación");
       const archivo = path.resolve(arg);
       if (!fs.existsSync(archivo)) fail(`no existe ${archivo}`);
-      const args = { archivo, armature_nombre: str(opts.armature), nombre: str(opts.nombre), en_sitio: !!opts["en-sitio"], conservar: !!opts.conservar, nla: !!opts.nla };
+      const args = {
+        archivo, armature_nombre: str(opts.armature), nombre: str(opts.nombre), en_sitio: !!opts["en-sitio"], conservar: !!opts.conservar, nla: !!opts.nla,
+        pies: str(opts.pies) || "apoyar", cabeza: str(opts.cabeza) || "auto", estabilidad: opts.estabilidad !== undefined ? num(opts.estabilidad) : null,
+      };
       return show(await execute(pyRig("importar_animacion", args), opts), opts);
     }
     case "video": {
@@ -1644,10 +1931,27 @@ async function main() {
         motor: motores[m] || m, muestras: opts.muestras ? num(opts.muestras) : null, vista: str(opts.vista) || "tres_cuartos",
         objetos: lista(opts.objetos), coleccion: str(opts.coleccion), luces: str(opts.luces) || "auto",
         hoja: typeof opts.hoja === "string" ? path.resolve(opts.hoja) : null, nHoja: num(opts.n, 6), conNiebla: !!opts["con-niebla"],
+        encuadrar: lista(opts.encuadrar),
       });
       const r = await execute(code, opts, { guardar: false });
       fs.rmSync(tmpdir, { recursive: true, force: true });
       return show(r, opts);
+    }
+    case "comparar": {
+      if (!arg) fail("falta la imagen de referencia: buho-blender comparar foto.png [--blend x.blend] [--vista camara]");
+      const referencia = path.resolve(arg);
+      if (!fs.existsSync(referencia)) fail(`no existe ${referencia}`);
+      if (typeof opts.blend === "string") { opts.fondo = true; opts.archivo = opts.blend; }
+      const base = path.basename(referencia, path.extname(referencia));
+      const salida = path.resolve(str(opts.salida) || `comparacion_${base}.png`);
+      const renderRuta = salida.replace(/\.png$/i, "") + "_render.png";
+      const code = pyComparar({
+        referencia, salida, renderRuta, alto: num(opts.alto, 540), vista: str(opts.vista) || "camara",
+        motor: str(opts.motor) || "BLENDER_EEVEE", muestras: opts.muestras ? num(opts.muestras) : null,
+        objetos: lista(opts.objetos), coleccion: str(opts.coleccion), frame: opts.frame !== undefined ? num(opts.frame) : null,
+        conNiebla: !!opts["con-niebla"], encuadrar: lista(opts.encuadrar), opaco: !!opts.opaco, umbral: num(opts.umbral, 0.12),
+      });
+      return show(await execute(code, opts, { guardar: false }), opts);
     }
     case "pantalla": {
       if (opts.fondo) fail("pantalla necesita el Blender abierto con ventana (sin --fondo); usa captura");
