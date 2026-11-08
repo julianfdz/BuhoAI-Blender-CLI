@@ -1,6 +1,6 @@
 ---
 name: buho-blender
-description: Modelar, esculpir, poner esqueleto, animar, fotografiar, grabar en vídeo, medir, importar y exportar modelos 3D en Blender con el CLI `buho-blender`, en directo en el Blender abierto (se ve lo que haces) o sin ventana para generar en lote. Úsala SIEMPRE que haya que crear o retocar un modelo 3D, un arma, un prop, un personaje, una figura tipo Funko o un escenario, esculpir una forma orgánica, ponerle huesos y animarlo (andar, puñetazos, saludar, saltar, bailar, animaciones de Mixamo), sacar una captura, una hoja de vistas o un vídeo/GIF de un .blend, contar polígonos, importar un GLB/FBX/OBJ/STL, exportar a GLB/FBX/OBJ para Unity o la web, buscar algo en la API de Blender o revisar qué hay en una escena, aunque no se nombre el CLI. Vale para cualquier agente con terminal (Claude, Codex, Copilot, Gemini, scripts).
+description: Modelar, esculpir, poner esqueleto, animar, fotografiar, grabar en vídeo, medir, importar y exportar modelos 3D en Blender con el CLI `buho-blender`, en directo en el Blender abierto (se ve lo que haces) o sin ventana para generar en lote. Úsala SIEMPRE que haya que crear o retocar un modelo 3D, un arma, un prop, un personaje, una figura tipo Funko o un escenario, esculpir una forma orgánica, ponerle huesos y animarlo (andar, puñetazos, saludar, saltar, bailar, animaciones de Mixamo), sacar una captura, una hoja de vistas o un vídeo/GIF de un .blend, contar polígonos, importar un GLB/FBX/OBJ/STL, exportar a GLB/FBX/OBJ para Unity o la web, optimizar un modelo pesado (bajar polígonos y hornear texturas PBR), prepararlo para imprimir en 3D (STL/3MF cerrado, vaciado, a medida en mm), hacer un visor 3D en HTML para enseñarlo, buscar algo en la API de Blender o revisar qué hay en una escena, aunque no se nombre el CLI. Vale para cualquier agente con terminal (Claude, Codex, Copilot, Gemini, scripts).
 ---
 
 # buho-blender
@@ -40,6 +40,11 @@ buho-blender importar pieza.glb [--en Coleccion]   # .glb .gltf .fbx .obj .stl .
 buho-blender importar otro.blend --objetos "A,B"    # o --colecciones "X,Y"
 buho-blender exportar salida.glb         # o .fbx / .obj; --objetos "A,B" o --coleccion X; --unir = una sola malla
 buho-blender limpiar                     # purga datos huérfanos
+
+# Llevarlo fuera (Unity/web, impresora 3D, visor)
+buho-blender optimizar figura.glb [--caras 30000] [--texturas 2048] [--jpg]   # baja + texturas PBR horneadas
+buho-blender imprimir figura.stl [--altura-mm 120] [--hueco 2] [--unir] [--ambos]   # malla cerrada en mm + informe
+buho-blender visor figura.html --glb figura.glb [--titulo "..."] [--abrir]          # HTML con visor 3D, un solo archivo
 
 # Esqueleto y animación
 buho-blender esqueleto [Objeto] [--coleccion X] [--tipo humanoide|cuadrupedo|cadena] [--auto] [--huesos h.json]
@@ -84,7 +89,7 @@ El JSON dice cuáles en `fondo_fuera_del_encuadre`. Si la cámara quedaría al o
 5. **Itera con `vigilar`**: deja `buho-blender vigilar modelo.py --captura c.png --vistas frente,derecha,tres_cuartos,arriba` en segundo plano; cada vez que guardas el .py (o `lib/buho3d.py`) lo vuelve a ejecutar y rehace la hoja. Cada pasada imprime una línea JSON con `ok`, `result` o `error`. `--veces N` para que acabe solo.
 6. **Comprueba con los ojos**: una hoja de contactos (`--vistas`) y léela antes de dar algo por bueno. Si copias algo real (una foto, un logo, un producto), `comparar foto.jpg` antes de enseñarlo: mira la imagen y las métricas (ver «Comparar con una referencia»). La captura encuadra sola los objetos y pone cámara y luces temporales; no deja nada en la escena. Con `--vista camara` usa la cámara y la luz de la escena. `pantalla` enseña lo que ve el usuario en su ventana.
 7. **Para enseñarlo**: `giro modelo.mp4` (o `.gif`) da una vuelta al modelo quieto; `video anim.mp4 --camara orbita` graba la animación mientras la cámara gira. Si va a tardar (Cycles, vídeos largos), añade `--en-cola` y sigue trabajando; avisa al usuario del progreso con `cola`.
-8. **Exporta** a GLB para Unity (glTFast) o la web: Y arriba, escala aplicada, modificadores aplicados. Medidas reales en metros (`stats` da `tamano_m`).
+8. **Exporta** a GLB para Unity (glTFast) o la web: Y arriba, escala aplicada, modificadores aplicados. Medidas reales en metros (`stats` da `tamano_m`). Si es pesado o tiene materiales procedurales, `optimizar`; para imprimir, `imprimir`; para enseñarlo, `visor`.
 9. **Dudas de la API**: `buho-blender docs "keyframe_insert"` antes de inventarte un parámetro.
 
 ## Esqueleto y animación (buho_rig)
@@ -193,6 +198,38 @@ Cualquier `giro`, `video`, `captura`, `run` o `comparar` con `--en-cola` (o `--s
   - `S.mascara(sdf, P, ancho)` define zonas, que `malla(..., mascaras=...)` guarda como atributos de vértice (0..1). Se leen con un nodo **Attribute** (nombre de la máscara → Fac) para mezclar materiales por zonas.
   - Para los relieves, **Geometry → Pointiness** con una rampa estrecha (p. ej. 0,56→0,64) pinta las aristas y las crestas (oro en lo que sobresale, sucio en lo hundido). Pointiness solo funciona en Cycles.
 - **Ejemplo completo**: `modelos/buho_estatua/buho_esculpido.py`.
+
+## Llevar el modelo fuera (buho_export)
+
+`lib/buho_export.py` (también `import buho_export as bx` desde un script). Los tres comandos valen con `--fondo --archivo x.blend` (lo normal) o en directo; en directo no dejan nada en la escena (lo temporal va a la colección `_buho_export` y se borra; los materiales, la visibilidad y el render se restauran), salvo `--dejar`. Eligen solo la geometría visible sin humo/niebla, o `--objetos "A,B"` / `--coleccion X`.
+
+**`optimizar <salida.glb|.fbx>`**: para Unity (glTFast) o la web.
+
+- Copia alta (modificadores, curvas e instancias evaluados, con la misma matriz: el ruido en coordenadas de objeto no cambia) → baja: todas las piezas en una malla, Decimate hasta `--caras` triángulos (30.000). `--metodo remallado` remalla por vóxeles antes (una sola piel sin caras ocultas entre piezas que se cruzan; pierde lo más fino que el vóxel).
+- Smart UV Project + empaquetado; bake en Cycles con GPU, alta → baja (selected to active), con la extrusión calculada de la distancia real entre las dos mallas.
+- Canales: color base, rugosidad, metal (cada uno pasado a una Emission y horneado como EMIT, así sale el material procedural tal cual: oro por Pointiness, máscaras de atributos, ruido), normal (tangente) y AO; emisión y alfa solo si algún material los usa. `--texturas 1024|2048|4096`.
+- Material PBR con esas imágenes (la AO va por el grupo «glTF Material Output»; el GLB junta metal, rugosidad y AO en una textura ORM).
+- GLB con las texturas dentro (`--jpg` o `--webp` para que pese menos; `--pngs` deja también los PNG). `.fbx` exporta el FBX + `<nombre>_color.png`, `_normal`, `_rugosidad`, `_metal`, `_ao` al lado.
+- **Revisa siempre** `<salida>_comparacion.png` (original a la izquierda, optimizado a la derecha, en tres cuartos y de frente, Cycles con la misma luz). `--sin-comparar` lo salta.
+- Informe: triángulos antes/después, MB, canales, extrusión usada, tiempos. Unos 90 s para el búho de 1,28 M triángulos a 30.000 con 2048 px.
+
+**`imprimir <salida.stl|.3mf>`**: para la impresora.
+
+- Junta las piezas en milímetros: alto `--altura-mm` (120), apoyado en Z = 0 y centrado.
+- Si hay piezas sueltas, agujeros, aristas no manifold, normales incoherentes, `--hueco` o `--unir`, la rehace con openvdb (vóxel `--voxel-mm`, por defecto alto/600 entre 0,08 y 0,5 mm). Así queda una sola piel cerrada. Quita los restos de piezas metidas dentro de otras (patillas, curvas sin tapa) y los huecos internos.
+- `--hueco 2` vacía con paredes de 2 mm: deja la cavidad con las normales hacia dentro y quita las cavidades diminutas. No hace agujeros de drenaje: en resina, añádelos en el laminador.
+- `--unir` cierra además rendijas de hasta `--cerrar-mm` (por defecto 0,5 mm), para que las piezas casi pegadas queden soldadas.
+- Decima hasta `--caras-max` (600.000), pero solo si la malla sigue cerrada.
+- Comprueba: aristas abiertas / no manifold, normales, piezas que no se tocan, grosor aproximado con rayos hacia dentro (min, p1, p5, mediana; `--grosor-min 1`), volumen en cm³ y apoyo en la cama. `ok` y `problemas` resumen.
+- STL binario y 3MF propios (Blender 5.2 no trae exportador 3MF; el 3MF es el núcleo del formato en mm). `--ambos` escribe los dos.
+- **Revisa** `<salida>_vista.png`: la pieza entera y cortada por la mitad para ver la pared. `--sin-captura` lo salta.
+
+**`visor <salida.html>`**: una página que se abre con doble clic.
+
+- Lleva el GLB en base64 dentro del HTML. Usa `<model-viewer>` 4.0.0 de unpkg (hace falta conexión la primera vez).
+- Se gira con el ratón, gira solo, tiene fondo neutro y modo claro/oscuro (sigue al sistema y tiene botón). Enseña triángulos y MB.
+- `--glb x.glb` usa ese archivo. Sin él, exporta la escena o la selección, y avisa si hay materiales procedurales, porque glTF no los lleva (saldrían blancos). En ese caso, pasa antes por `optimizar`.
+- Avisa si el HTML pasa de 16 MB (no cabe como Artifact). Para bajarlo: `optimizar --caras 15000 --texturas 1024 --jpg`. `--abrir` lo abre en el navegador.
 
 ## Archivos y seguridad
 
