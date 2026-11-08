@@ -991,14 +991,40 @@ def _ls(V, T, voxel, ex=3.0, inn=3.0):
                                                     transform=tr, exBandWidth=float(ex), inBandWidth=float(inn))
 
 
-def _iso(g, valor):
-    P, Tr, Q = g.convertToPolygons(isovalue=float(valor), adaptivity=0.0)
+def _iso(g, valor, adaptividad=0.0):
+    P, Tr, Q = g.convertToPolygons(isovalue=float(valor), adaptivity=float(adaptividad))
     P = np.asarray(P, dtype=np.float64).reshape(-1, 3)
     T = _quads_a_tris(Tr, Q)
     if not len(T):
         return P, T
     tol = float(g.transform.voxelSize()[0]) * 1e-3 if hasattr(g.transform, "voxelSize") else 1e-5
-    return _soldar(P, T, tol)
+    P, T = _soldar(P, T, tol)
+    return P, _tris_validos(T)
+
+
+def _tris_validos(T):
+    """Quita triángulos degenerados (un vértice repetido: salen al soldar quads aplastados de openvdb) y caras
+    repetidas (dos iguales con orientación contraria se anulan; si no, se deja una). Con ellos dentro,
+    from_pydata crea una malla no válida y el Decimate de Blender no termina."""
+    T = T[(T[:, 0] != T[:, 1]) & (T[:, 1] != T[:, 2]) & (T[:, 0] != T[:, 2])]
+    if not len(T):
+        return T
+    st = np.sort(T, axis=1)
+    _, inv, cnt = np.unique(st, axis=0, return_inverse=True, return_counts=True)
+    inv = inv.reshape(-1)
+    rep = cnt[inv] > 1
+    if not rep.any():
+        return T
+    k = np.argmin(T, axis=1)
+    sig = T[np.arange(len(T)), (k + 1) % 3]
+    sgn = np.where(sig == st[:, 1], 1, -1)
+    neto = np.bincount(inv, weights=sgn, minlength=len(cnt))
+    quedan = ~rep
+    ir = np.nonzero(rep)[0]
+    cand = ir[sgn[ir] == np.sign(neto[inv[ir]])]
+    _, primero = np.unique(inv[cand], return_index=True)
+    quedan[cand[primero]] = True
+    return T[quedan]
 
 
 def _por_componente(V, T):
@@ -1059,25 +1085,26 @@ def _limpiar(V, T, quitar_dentro=True, cavidad_min=0.0):
     return V, T, info
 
 
-def _vdb_malla(V, T, voxel, hueco, cerrar=0.0):
+def _vdb_malla(V, T, voxel, hueco, cerrar=0.0, adaptividad=0.0):
     """Una sola piel cerrada con openvdb: unión de todas las piezas, sin restos internos, cierre opcional de
-    rendijas (cerrar, mm) y vaciado opcional (hueco, mm). Devuelve V, T, info y cuántos triángulos son de fuera."""
+    rendijas (cerrar, mm) y vaciado opcional (hueco, mm). La adaptividad de openvdb (0–1) solo se usa en
+    la piel que se devuelve: junta vóxeles planos en polígonos grandes y deja la malla cerrada. Devuelve V, T, info y cuántos triángulos son de fuera."""
     info = {}
     if cerrar > 0:
         g = _ls(V, T, voxel, ex=3.0 + cerrar / voxel)
         P, Tr = _iso(g, cerrar)
         g = _ls(P, Tr, voxel, inn=3.0 + cerrar / voxel)
-        P, Tr = _iso(g, -cerrar)
+        P, Tr = _iso(g, -cerrar, adaptividad if hueco <= 0 else 0.0)
         info["rendijas_cerradas_mm"] = round(cerrar, 3)
     else:
-        P, Tr = _iso(_ls(V, T, voxel), 0.0)
+        P, Tr = _iso(_ls(V, T, voxel), 0.0, adaptividad if hueco <= 0 else 0.0)
     P, Tr, limpieza = _limpiar(P, Tr)
     info.update({"piezas_internas_quitadas": limpieza["internas"], "huecos_internos_quitados": limpieza["huecos_sueltos"]})
     if hueco <= 0:
         return P, Tr, info, len(Tr)
     g = _ls(P, Tr, voxel, inn=hueco / voxel + 3.0)
-    Pe, Te = _iso(g, 0.0)
-    Pi, Ti = _iso(g, -hueco)
+    Pe, Te = _iso(g, 0.0, adaptividad)
+    Pi, Ti = _iso(g, -hueco, adaptividad)
     if not len(Ti):
         info["sin_hueco"] = True
         return Pe, Te, info, len(Te)
@@ -1115,27 +1142,89 @@ def _orientar(V, T, n_ext):
     return np.concatenate([ext, inn]) if len(inn) else ext
 
 
-def _decimar(est, V, T, maximo):
-    me = bpy.data.meshes.new("_bx_imp_dec")
-    me.from_pydata(V.tolist(), [], T.tolist())
-    est.mallas.append(me)
-    o = est.objeto("_bx_imp_dec", me)
-    md = o.modifiers.new("decimate", "DECIMATE")
-    md.decimate_type = "COLLAPSE"
-    md.ratio = max(min(maximo / len(T), 1.0), 1e-4)
-    md.use_collapse_triangulate = True
-    _aplicar(est, o)
-    V2 = _verts_mundo(o.data, mathutils.Matrix.Identity(4))
-    T2 = _triangulos(o.data)
-    bpy.data.objects.remove(o, do_unlink=True)
-    return V2, T2
+def _malla_np(nombre, V, T):
+    """Malla de Blender desde numpy con foreach_set (from_pydata con listas tarda ~5 s por millón) + validate."""
+    me = bpy.data.meshes.new(nombre)
+    me.vertices.add(len(V))
+    me.vertices.foreach_set("co", np.ascontiguousarray(V, dtype=np.float32).ravel())
+    me.loops.add(len(T) * 3)
+    me.loops.foreach_set("vertex_index", np.ascontiguousarray(T, dtype=np.int32).ravel())
+    me.polygons.add(len(T))
+    me.polygons.foreach_set("loop_start", np.arange(0, 3 * len(T), 3, dtype=np.int32))
+    me.update(calc_edges=True)
+    me.validate(verbose=False)
+    return me
+
+
+# Se ejecuta en un Blender aparte (-b) para poder cortarlo por tiempo: un modificador en marcha no se puede
+# interrumpir desde dentro.
+_SCRIPT_DECIMAR = r"""
+import sys, numpy as np, bpy
+ent, sal, maximo = sys.argv[-3], sys.argv[-2], int(sys.argv[-1])
+d = np.load(ent)
+V, T = d["V"], d["T"]
+me = bpy.data.meshes.new("d")
+me.vertices.add(len(V)); me.vertices.foreach_set("co", V.astype(np.float32).ravel())
+me.loops.add(len(T) * 3); me.loops.foreach_set("vertex_index", T.astype(np.int32).ravel())
+me.polygons.add(len(T)); me.polygons.foreach_set("loop_start", np.arange(0, 3 * len(T), 3, dtype=np.int32))
+me.update(calc_edges=True)
+me.validate(verbose=False)
+o = bpy.data.objects.new("d", me)
+bpy.context.scene.collection.objects.link(o)
+md = o.modifiers.new("d", "DECIMATE")
+md.decimate_type = "COLLAPSE"
+md.ratio = max(min(maximo / max(len(me.polygons), 1), 1.0), 1e-4)
+md.use_collapse_triangulate = True
+dg = bpy.context.evaluated_depsgraph_get()
+m2 = o.evaluated_get(dg).to_mesh()
+m2.calc_loop_triangles()
+V2 = np.empty(len(m2.vertices) * 3, dtype=np.float32); m2.vertices.foreach_get("co", V2)
+T2 = np.empty(len(m2.loop_triangles) * 3, dtype=np.int32); m2.loop_triangles.foreach_get("vertices", T2)
+np.savez(sal, V=V2.reshape(-1, 3), T=T2.reshape(-1, 3))
+"""
+
+
+def _decimar(V, T, maximo, limite_s):
+    """Decimate COLLAPSE en un Blender sin ventana aparte, con tope de tiempo. Devuelve (V, T, None) o
+    (None, None, motivo) si no ha terminado a tiempo o ha fallado."""
+    import subprocess
+    tmp = tempfile.mkdtemp(prefix="buho_dec_")
+    ent, sal, scr = (os.path.join(tmp, n) for n in ("ent.npz", "sal.npz", "decimar.py"))
+    try:
+        np.savez(ent, V=V.astype(np.float32), T=T.astype(np.int32))
+        with open(scr, "w", encoding="utf-8") as f:
+            f.write(_SCRIPT_DECIMAR)
+        cmd = [bpy.app.binary_path, "-b", "--factory-startup", "--python", scr, "--", ent, sal, str(int(maximo))]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=float(limite_s),
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            return None, None, "el decimado no ha terminado en %d s" % limite_s
+        if not os.path.exists(sal):
+            err = (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
+            return None, None, "el decimado ha fallado (%s)" % " | ".join(err)
+        d = np.load(sal)
+        return d["V"].astype(np.float64), d["T"].astype(np.int64), None
+    finally:
+        for n in (ent, sal, scr):
+            try:
+                os.remove(n)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp)
+        except OSError:
+            pass
 
 
 def _grosor(V, T, n=20000, minimo=1.0):
     """Grosor aproximado: rayos hacia dentro desde puntos de la superficie hasta la cara de enfrente."""
     bvh = BVHTree.FromPolygons(V.tolist(), T.tolist())
     rng = np.random.default_rng(7)
-    idx = rng.choice(len(T), min(n, len(T)), replace=False)
+    # Muestras por área, no por triángulo: si no, las zonas más teseladas (detalles finos, o una malla
+    # adaptativa con las zonas planas en polígonos grandes) pesan de más y el porcentaje no es «de superficie».
+    ar = np.linalg.norm(np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]]), axis=1)
+    idx = rng.choice(len(T), min(n, int((ar > 0).sum())), replace=False, p=ar / ar.sum())
     v0, v1, v2 = V[T[idx, 0]], V[T[idx, 1]], V[T[idx, 2]]
     c = (v0 + v1 + v2) / 3
     nn = np.cross(v1 - v0, v2 - v0)
@@ -1208,7 +1297,8 @@ def _escribir_3mf(ruta, V, T, nombre):
 
 
 def imprimir(salida, altura_mm=120.0, hueco=0.0, unir=False, objetos=None, coleccion=None, voxel_mm=None,
-             caras_max=600000, grosor_min=1.0, ambos=False, captura=None, dejar=False, cerrar_mm=None):
+             caras_max=600000, grosor_min=1.0, ambos=False, captura=None, dejar=False, cerrar_mm=None,
+             adaptividad=None, decimar_s=90):
     t_ini = time.time()
     salida = os.path.abspath(salida)
     ext = os.path.splitext(salida)[1].lower()
@@ -1260,31 +1350,56 @@ def imprimir(salida, altura_mm=120.0, hueco=0.0, unir=False, objetos=None, colec
         n_ext = len(T)
         if necesita:
             t0 = time.time()
+            voxel_info = {}
             if voxel_mm is None:
-                voxel_mm = min(max(altura_mm / 600.0, 0.08), 0.5)
+                # Detalle según la altura, pero sin pasar del tope de triángulos de openvdb (sin adaptividad
+                # salen ~1,2 triángulos por vóxel² de superficie; con vaciado, la pared de dentro casi otra vez).
+                calidad = min(max(altura_mm / 600.0, 0.08), 0.5)
+                tope = max(6 * int(caras_max), 1500000)
+                sup = antes["area"] * (2.0 if hueco > 0 else 1.0)
+                por_tope = math.sqrt(1.2 * sup / tope)
+                voxel_mm = round(max(calidad, por_tope), 4)
+                voxel_info = {"voxel_auto": "tope de triángulos" if por_tope > calidad else "altura",
+                              "triangulos_estimados_sin_adaptividad": int(1.2 * sup / voxel_mm ** 2)}
             voxel_mm = float(voxel_mm)
+            if adaptividad is None:
+                # Con vaciado no: la adaptividad adelgaza la pared (Funko a 60 mm, hueco 1,5: p1 de 1,36 a
+                # 0,49 mm) y deja algún cruce entre caras; ahí reduce el Decimate, que respeta la pared.
+                adaptividad = 0.0 if hueco > 0 else 0.05
+            adaptividad = float(adaptividad)
             cerrar = float(cerrar_mm) if cerrar_mm else (max(0.5, 2 * voxel_mm) if unir else 0.0)
-            V, T, vinfo, n_ext = _vdb_malla(V, T, voxel_mm, hueco, cerrar)
-            remallado = {"motivo": necesita, "voxel_mm": voxel_mm, "triangulos": int(len(T)), **vinfo}
+            V, T, vinfo, n_ext = _vdb_malla(V, T, voxel_mm, hueco, cerrar, adaptividad)
+            remallado = {"motivo": necesita, "voxel_mm": voxel_mm, **voxel_info, "adaptividad": adaptividad,
+                         "triangulos": int(len(T)), **vinfo}
             if hueco > 0 and vinfo.get("sin_hueco"):
                 avisos.append("no cabe un hueco de %.2f mm: el modelo es más fino que el doble de la pared; "
                               "queda macizo" % hueco)
             tiempos["remallado_s"] = round(time.time() - t0, 1)
         T = _orientar(V, T, n_ext)
+        T = _tris_validos(T)
         if len(T) > caras_max:
             t0 = time.time()
-            Vd, Td = _decimar(est, V, T, caras_max)
-            Vd, Td = _soldar(Vd, Td, 1e-5)
-            chk = _analisis(Vd, Td)
-            if chk["aristas_abiertas"] == 0 and chk["aristas_no_manifold"] == 0:
-                V, T = Vd, Td
-                if remallado is not None:
-                    remallado["decimado_a"] = int(len(T))
-                else:
-                    remallado = {"decimado_a": int(len(T))}
+            if len(T) > 40 * caras_max:
+                avisos.append("%d triángulos son demasiados para decimar a %d: se escribe sin decimar (sube "
+                              "--voxel-mm o --adaptividad)" % (len(T), caras_max))
             else:
-                avisos.append("el decimado rompía la malla (%d aristas abiertas, %d no manifold): se deja sin "
-                              "decimar con %d triángulos" % (chk["aristas_abiertas"], chk["aristas_no_manifold"], len(T)))
+                Vd, Td, fallo = _decimar(V, T, caras_max, decimar_s)
+                if fallo:
+                    avisos.append("%s: se escribe sin decimar con %d triángulos" % (fallo, len(T)))
+                else:
+                    Vd, Td = _soldar(Vd, Td, 1e-5)
+                    Td = _tris_validos(Td)
+                    chk = _analisis(Vd, Td)
+                    if chk["aristas_abiertas"] == 0 and chk["aristas_no_manifold"] == 0:
+                        V, T = Vd, Td
+                        if remallado is not None:
+                            remallado["decimado_a"] = int(len(T))
+                        else:
+                            remallado = {"decimado_a": int(len(T))}
+                    else:
+                        avisos.append("el decimado rompía la malla (%d aristas abiertas, %d no manifold): se deja "
+                                      "sin decimar con %d triángulos"
+                                      % (chk["aristas_abiertas"], chk["aristas_no_manifold"], len(T)))
             tiempos["decimado_s"] = round(time.time() - t0, 1)
         T = T[(T[:, 0] != T[:, 1]) & (T[:, 1] != T[:, 2]) & (T[:, 0] != T[:, 2])]
         usados = np.unique(T)
@@ -1351,8 +1466,7 @@ def imprimir(salida, altura_mm=120.0, hueco=0.0, unir=False, objetos=None, colec
             res["captura"] = _captura_impresion(est, V, T, captura, hueco > 0)
             tiempos["captura_s"] = round(time.time() - t0, 1)
         if dejar:
-            me = bpy.data.meshes.new(nombre + "_impresion")
-            me.from_pydata(V.tolist(), [], T.tolist())
+            me = _malla_np(nombre + "_impresion", V, T)
             o = est.objeto(nombre + "_impresion", me)
             o.scale = (0.001, 0.001, 0.001)
             res["dejado"] = {"objeto": o.name, "coleccion": COLECCION_TMP, "nota": "escala 0,001: 1 unidad = 1 mm"}
@@ -1365,8 +1479,7 @@ def imprimir(salida, altura_mm=120.0, hueco=0.0, unir=False, objetos=None, colec
 def _captura_impresion(est, V, T, salida, cortar, ancho=720, alto=720):
     """Workbench: la pieza entera y, si está vaciada, cortada por la mitad para ver la pared."""
     sc = bpy.context.scene
-    me = bpy.data.meshes.new("_bx_imp_vista")
-    me.from_pydata(V.tolist(), [], T.tolist())
+    me = _malla_np("_bx_imp_vista", V, T)
     est.mallas.append(me)
     o = est.objeto("_bx_imp_vista", me)
     _ocultar_escena(est)

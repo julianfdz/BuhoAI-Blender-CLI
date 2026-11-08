@@ -44,6 +44,7 @@ buho-blender limpiar                     # purga datos huérfanos
 # Llevarlo fuera (Unity/web, impresora 3D, visor)
 buho-blender optimizar figura.glb [--caras 30000] [--texturas 2048] [--jpg]   # baja + texturas PBR horneadas
 buho-blender imprimir figura.stl [--altura-mm 120] [--hueco 2] [--unir] [--ambos]   # malla cerrada en mm + informe
+                                         # [--voxel-mm X] [--adaptividad 0-1] [--caras-max 600000] [--decimar-s 90]
 buho-blender visor figura.html --glb figura.glb [--titulo "..."] [--abrir]          # HTML con visor 3D, un solo archivo
 
 # Esqueleto y animación
@@ -216,10 +217,10 @@ Cualquier `giro`, `video`, `captura`, `run` o `comparar` con `--en-cola` (o `--s
 **`imprimir <salida.stl|.3mf>`**: para la impresora.
 
 - Junta las piezas en milímetros: alto `--altura-mm` (120), apoyado en Z = 0 y centrado.
-- Si hay piezas sueltas, agujeros, aristas no manifold, normales incoherentes, `--hueco` o `--unir`, la rehace con openvdb (vóxel `--voxel-mm`, por defecto alto/600 entre 0,08 y 0,5 mm). Así queda una sola piel cerrada. Quita los restos de piezas metidas dentro de otras (patillas, curvas sin tapa) y los huecos internos.
+- Si hay piezas sueltas, agujeros, aristas no manifold, normales incoherentes, `--hueco` o `--unir`, la rehace con openvdb. Así queda una sola piel cerrada. Vóxel `--voxel-mm`; por defecto, alto/600 entre 0,08 y 0,5 mm, pero más grueso si así la malla pasaría de 6 × `--caras-max` triángulos (se estima con el área; el informe dice `voxel_auto` y la estimación). Sin `--hueco`, la piel final sale con `--adaptividad` 0,05 de openvdb (junta las zonas planas: unas 10 veces menos triángulos, cerrada, aunque deja 3–5 pares de caras cruzadas que los laminadores toleran). Con `--hueco` va a 0, porque la adaptividad adelgaza la pared; ahí reduce el Decimate. Quita los restos de piezas metidas dentro de otras (patillas, curvas sin tapa) y los huecos internos.
 - `--hueco 2` vacía con paredes de 2 mm: deja la cavidad con las normales hacia dentro y quita las cavidades diminutas. No hace agujeros de drenaje: en resina, añádelos en el laminador.
 - `--unir` cierra además rendijas de hasta `--cerrar-mm` (por defecto 0,5 mm), para que las piezas casi pegadas queden soldadas.
-- Decima hasta `--caras-max` (600.000), pero solo si la malla sigue cerrada.
+- Si aún pasa de `--caras-max` (600.000), decima en un Blender sin ventana aparte con tope de `--decimar-s` (90 s) y solo si sigue cerrada; si no termina a tiempo o la rompe, escribe sin decimar y lo dice en `avisos`.
 - Comprueba: aristas abiertas / no manifold, normales, piezas que no se tocan, grosor aproximado con rayos hacia dentro (min, p1, p5, mediana; `--grosor-min 1`), volumen en cm³ y apoyo en la cama. `ok` y `problemas` resumen.
 - STL binario y 3MF propios (Blender 5.2 no trae exportador 3MF; el 3MF es el núcleo del formato en mm). `--ambos` escribe los dos.
 - **Revisa** `<salida>_vista.png`: la pieza entera y cortada por la mitad para ver la pared. `--sin-captura` lo salta.

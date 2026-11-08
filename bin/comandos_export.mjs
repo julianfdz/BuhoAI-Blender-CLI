@@ -192,7 +192,9 @@ export async function comandoExport(cmd, arg, opts, ctx) {
       caras_max: num(opts["caras-max"], 600000), grosor_min: num(opts["grosor-min"], 1), ambos: !!opts.ambos,
       captura: opts["sin-captura"] ? null : (str(opts.captura) ? path.resolve(opts.captura) : salida.replace(/\.(stl|3mf)$/i, "_vista.png")),
       dejar: !!opts.dejar, cerrar_mm: opts["cerrar-mm"] ? num(opts["cerrar-mm"]) : null,
+      adaptividad: opts.adaptividad === undefined ? null : num(opts.adaptividad, null), decimar_s: num(opts["decimar-s"], 90),
     };
+    if (args.adaptividad !== null && !(args.adaptividad >= 0 && args.adaptividad <= 1)) fail("--adaptividad entre 0 y 1");
     if (!(args.altura_mm > 0)) fail("--altura-mm tiene que ser un número > 0");
     return show(await execute(pyExport("imprimir", args), opts, { guardar: !!opts.dejar }), opts);
   }

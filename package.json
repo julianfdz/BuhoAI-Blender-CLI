@@ -1,6 +1,6 @@
 {
   "name": "buhoai-blender-cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "buho-blender: CLI para que los agentes trabajen con Blender (en directo por el puerto del complemento MCP o sin ventana)",
   "type": "module",
   "bin": { "buho-blender": "bin/buho-blender.mjs" },

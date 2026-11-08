@@ -78,3 +78,39 @@
   - Cuenta triángulos, materiales, texturas y animaciones leyendo el bloque JSON del GLB, sin cargar la geometría.
   - **Prueba**: Chrome headless con `--screenshot` y `--virtual-time-budget` pinta bien el Funko (1,3 MB). Con el búho de 11,6 MB salía en blanco por el tiempo virtual. Servido por http y con Playwright, el búho carga (`mv.loaded = true`) y se ve con sus texturas. El Playwright del entorno bloquea `file://`.
   - Con `visor` sin `--glb`, los materiales procedurales salen blancos en glTF (el Funko tal cual); de ahí el aviso.
+
+## 0.5.1 (08/11/2026): imprimir ya no se cuelga en el decimado
+
+- **Bug**: `imprimir salida.stl --altura-mm 60 --hueco 1.5` (vóxel automático 0,1 mm) se quedaba más de 15 min en `_decimar`. openvdb rehacía la malla en ~20 s (4,08 M triángulos), pero el Decimate de Blender no terminaba.
+- **Causa** (medida aislando la malla en un .npz y probando en Blender sin ventana): al soldar la salida de `convertToPolygons`, los quads aplastados dan **triángulos degenerados** (un vértice repetido: 1.346 en ese caso) y alguna cara repetida (16). `from_pydata` no valida, así que la malla queda no válida y el Decimate COLLAPSE entra en un bucle: la misma malla tal cual seguía sin terminar a los 180 s; sin degenerados (o tras `mesh.validate()`) decimaba 4,08 M → 600.000 en 21–24 s. No era el número de caras, ni los quads/tris, ni el ratio (0,15). Los 120 mm con vóxel 0,2 funcionaban porque esa malla no traía degenerados.
+- **Arreglo de raíz**:
+  - `_tris_validos` quita degenerados y caras repetidas en cada isosuperficie (`_iso`) y antes de decimar. Si dos caras iguales tienen orientación contraria, se quitan las dos, porque se anulan; si no, se deja una.
+  - Las mallas temporales se crean con `foreach_set` + `validate()` (`_malla_np`), no con `from_pydata`, que con listas tardaba ~5 s por millón.
+  - **Vóxel automático con tope**: el de siempre, alto/600 entre 0,08 y 0,5 mm, pero nunca más fino que `sqrt(1,2 · área · (2 si hay hueco) / tope)`. El tope es 6 × `--caras-max` (mínimo 1,5 M), y con `--caras-max` 600.000 sale en 3,6 M.
+    - El 1,2 son los triángulos por vóxel² de superficie sin adaptividad, medido en el Funko. El área es la de las piezas originales, así que cuenta de más por las que se solapan y queda conservador.
+    - El informe dice `voxel_auto` («altura» o «tope de triángulos») y `triangulos_estimados_sin_adaptividad`.
+  - **Adaptividad de openvdb** (`--adaptividad`), solo en la piel que se devuelve.
+    - Con 0,05 sale ~10 veces menos (Funko a 60 mm: 2,58 M → 225.000) y cerrada.
+    - Medido en el Funko a 60 mm con hueco 1,5 (grosor muestreado por área), adelgaza la pared. Con 0,05, el p1 baja de 1,19 a 0,44 mm, el mínimo de 0,43 a 0,00 mm y lo que queda por debajo de 1 mm sube del 0,6 % al 1,7 % de la superficie. Con 0,01 o 0,02 sigue igual de mal.
+    - Deja también 3–5 pares de caras que se cruzan; con BVH `overlap`, la decimada sale con 0.
+    - Por eso, por defecto va a **0,05 sin `--hueco`** y a **0 con `--hueco`**, donde reduce el Decimate.
+  - **Decimate con tope**: va en un Blender aparte (`bpy.app.binary_path -b --factory-startup`, malla por .npz) con `subprocess.run(timeout=--decimar-s)`, por defecto 90 s. Un modificador en marcha no se puede cortar desde dentro.
+    - Si no termina, falla o rompe la malla, se escribe sin decimar y se avisa.
+    - Por encima de 40 × `--caras-max` ni lo intenta.
+    - En directo tampoco toca el Blender del usuario: lanza otro proceso.
+- **Grosor por área**: `_grosor` muestreaba un triángulo al azar, no un punto de la superficie. Las zonas muy teseladas pesaban de más (en la malla sin decimar, p1 de 0,50 frente a 1,36 tras decimar). Ahora `rng.choice(..., p=área)`, y el porcentaje es de verdad «de la superficie».
+- **Pruebas 0.5.1** (`--fondo`, copias de `funko_juan.blend` y `buho_esculpido.blend`, los tres casos a la vez por modelo; tiempo total de la orden). Todos cerrados: 0 aristas abiertas, 0 no manifold y 0 normales incoherentes; una piel más la cavidad si hay vaciado.
+
+  | Caso | Vóxel (auto) | openvdb | Final | Decimado | Total |
+  |---|---|---|---|---|---|
+  | Funko 60 mm hueco 1,5 | 0,1217 (tope) | 2,75 M | 600.000 | 19 s | 53 s |
+  | Funko 120 mm hueco 2 | 0,2434 (tope) | 3,14 M | 600.000 | 22 s | 56 s |
+  | Funko 150 mm --unir | 0,25 (altura) | 245.092 (adapt. 0,05) | 245.092 | — | 18 s |
+  | Búho 60 mm hueco 1,5 | 0,1 (altura) | 3,77 M | 600.000 | 27 s | 77 s |
+  | Búho 120 mm hueco 2 | 0,2 (altura) | 3,94 M | 600.000 | 28 s | 79 s |
+  | Búho 150 mm --unir | 0,25 (altura) | 233.788 (adapt. 0,05) | 233.788 | — | 27 s |
+
+  Notas sobre las pruebas:
+  - Con `--decimar-s 4`, el Blender del decimado se corta a los 4 s y se escribe la malla de 2,75 M con aviso; 41 s en total.
+  - El Funko a 60 mm con vaciado sale con `ok: false`, por un 0,6 % de la superficie más fina de 1 mm. Son detalles finos de verdad a esa escala (gafas, brazos).
+  - Vistas revisadas: pieza entera y corte con la pared uniforme.

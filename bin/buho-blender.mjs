@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import * as cola from "../lib/buho_cola.mjs";
 import { comandoExport } from "./comandos_export.mjs";
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const HOST = process.env.BUHO_BLENDER_HOST || "127.0.0.1";
 let PORT = Number(process.env.BUHO_BLENDER_PORT || 9876);
 const BLENDER = process.env.BUHO_BLENDER_PATH || "D:\\Programas\\Blender\\blender.exe";
@@ -1659,7 +1659,7 @@ Hacer
   exportar <salida.glb|.gltf|.fbx|.obj> [--objetos "A,B" | --coleccion X] [--unir]
   limpiar                                   purga datos huérfanos (mallas, materiales… sin usuarios)
   optimizar <salida.glb|.fbx> [--caras 30000] [--texturas 2048] [--metodo auto|decimate|remallado] [--pngs] [--jpg]   baja + bake PBR (Unity/web)
-  imprimir <salida.stl|.3mf> [--altura-mm 120] [--hueco 2] [--unir] [--voxel-mm X] [--grosor-min 1] [--ambos]   malla cerrada en mm + informe
+  imprimir <salida.stl|.3mf> [--altura-mm 120] [--hueco 2] [--unir] [--voxel-mm X] [--adaptividad 0-1] [--caras-max 600000] [--decimar-s 90] [--grosor-min 1] [--ambos]   malla cerrada en mm + informe
   visor <salida.html> [--glb x.glb] [--titulo "..."] [--abrir]   HTML autocontenido con visor 3D (sin --glb exporta la escena)
 
 Archivos
