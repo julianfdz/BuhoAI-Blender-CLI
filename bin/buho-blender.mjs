@@ -40,7 +40,9 @@ function parseArgs(argv) {
   return out;
 }
 
-const py = (v) => JSON.stringify(v); // un string JSON también es un literal válido de Python
+// Literal de Python a partir de un valor JS (strings, números, listas, null, booleanos).
+const py = (v) => v === null || v === undefined ? "None" : v === true ? "True" : v === false ? "False"
+  : Array.isArray(v) ? `[${v.map(py).join(", ")}]` : JSON.stringify(v);
 
 function readCode(arg) {
   if (arg === undefined) fail("falta el código: un .py, un texto entre comillas o '-' para leer de la entrada");
