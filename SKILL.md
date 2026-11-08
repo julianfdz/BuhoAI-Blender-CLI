@@ -19,7 +19,7 @@ buho-blender estado                      # versión, archivo, nº de objetos, mo
 buho-blender escena                      # objetos con posición, tamaño, caras, materiales
 buho-blender run script.py               # ejecuta Python (bpy); también "código" o - (entrada)
 buho-blender captura salida.png --vista tres_cuartos   # frente|atras|derecha|izquierda|arriba|iso|camara
-buho-blender exportar salida.glb         # o .fbx / .obj; --objetos "A,B" o --coleccion X
+buho-blender exportar salida.glb         # o .fbx / .obj; --objetos "A,B" o --coleccion X; --unir = una sola malla
 buho-blender guardar archivo.blend
 buho-blender abrir [archivo.blend]
 ```
