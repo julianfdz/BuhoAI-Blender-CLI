@@ -14,6 +14,9 @@ CLI para que un agente de IA (Claude Code, Codex, Gemini, scripts) **modele, esc
 | Ejecutar | `run <script.py>`, `vigilar <script.py>` (re-ejecuta al guardar) |
 | Fotos y vídeo | `captura` (vistas sueltas u hoja de vistas, EEVEE o Cycles en GPU), `giro` (360° en MP4/GIF), `video` (cámara fija, frontal u órbita) |
 | Esqueleto y animación | `esqueleto` (humanoide, cuadrúpedo, cadena), `animar` (andar, puñetazos, saludar, saltar, bailar, idle… o poses en JSON), `importar-animacion` (Mixamo) |
+| Comparar con una referencia | `comparar foto.png` (referencia, render, superposición y siluetas, con métricas) |
+| Renders largos | `--en-cola` y `cola` (progreso y tiempo restante, cancelar) |
+| Llevarlo fuera | `optimizar` (baja de polígonos + bake PBR a GLB/FBX para Unity o web), `imprimir` (STL/3MF cerrado en mm, vaciado), `visor` (HTML con visor 3D) |
 | Archivos | `importar`, `exportar` (GLB/FBX/OBJ, `--unir`), `guardar`, `cargar`, `nuevo`, `limpiar`, `abrir` |
 
 Librerías Python para los scripts del agente (`import buho3d`, `import buho_sdf`, `import buho_rig`):
