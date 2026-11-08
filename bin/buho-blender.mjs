@@ -11,6 +11,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { comandoExport } from "./comandos_export.mjs";
 
 const VERSION = "0.3.0";
 const HOST = process.env.BUHO_BLENDER_HOST || "127.0.0.1";
@@ -1410,6 +1411,9 @@ Hacer
                                             .blend: append de todos sus objetos, o --objetos "A,B" / --colecciones "X,Y"
   exportar <salida.glb|.gltf|.fbx|.obj> [--objetos "A,B" | --coleccion X] [--unir]
   limpiar                                   purga datos huérfanos (mallas, materiales… sin usuarios)
+  optimizar <salida.glb|.fbx> [--caras 30000] [--texturas 2048] [--metodo auto|decimate|remallado] [--pngs] [--jpg]   baja + bake PBR (Unity/web)
+  imprimir <salida.stl|.3mf> [--altura-mm 120] [--hueco 2] [--unir] [--voxel-mm X] [--grosor-min 1] [--ambos]   malla cerrada en mm + informe
+  visor <salida.html> [--glb x.glb] [--titulo "..."] [--abrir]   HTML autocontenido con visor 3D (sin --glb exporta la escena)
 
 Archivos
   nuevo [salida.blend] [--vacia] [--descartar]   escena de fábrica sin el cubo (--vacia: sin cámara ni luz)
@@ -1649,6 +1653,10 @@ async function main() {
       fs.rmSync(tmpdir, { recursive: true, force: true });
       return show(r, opts);
     }
+    case "optimizar":
+    case "imprimir":
+    case "visor":
+      return comandoExport(cmd, arg, opts, { execute, show, fail });
     case "pantalla": {
       if (opts.fondo) fail("pantalla necesita el Blender abierto con ventana (sin --fondo); usa captura");
       const salida = path.resolve(arg || path.join(os.tmpdir(), `buho-blender-pantalla-${Date.now()}.png`));
